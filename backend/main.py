@@ -4,6 +4,7 @@ from fastapi import FastAPI, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from .db import SessionLocal, engine, Base
 from .models import DeviceModel, Device, DeviceMetricDefinition, InspectionLog, InspectionMetricValue, MetricAIAnalysis
@@ -70,7 +71,8 @@ def submit_inspection(payload: InspectionSubmit, db: Session = Depends(get_db)):
     dev = db.execute(select(Device).where(Device.id == payload.device_id)).scalar_one_or_none()
     if not dev:
         return {"status": "error", "anomalies": {}}
-    recorded_at = payload.recorded_at or datetime.utcnow()
+    tz = ZoneInfo("Asia/Shanghai")
+    recorded_at = payload.recorded_at or datetime.now(tz)
     log = InspectionLog(device_id=payload.device_id, user_id=payload.user_id, recorded_at=recorded_at)
     db.add(log)
     db.flush()
