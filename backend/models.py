@@ -1,8 +1,11 @@
+from decimal import Clamped
 from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, JSON, Index, PrimaryKeyConstraint
 from sqlalchemy.orm import relationship
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from .db import Base
 
+CST = ZoneInfo("Asia/Shanghai")
 
 class DeviceModel(Base):
     __tablename__ = "device_models"
@@ -15,6 +18,9 @@ class Device(Base):
     id = Column(Integer, primary_key=True)
     model_id = Column(Integer, ForeignKey("device_models.id"), nullable=False)
     name = Column(String(100), unique=True, nullable=False)
+    serial_number = Column(String(100), unique=True)
+    location = Column(String(100))
+    status = Column(String(50), default="activate")
     model = relationship("DeviceModel")
     __table_args__ = (Index("idx_devices_model", "model_id"),)
 
@@ -43,8 +49,8 @@ class InspectionLog(Base):
     id = Column(Integer, primary_key=True)
     device_id = Column(Integer, ForeignKey("devices.id"), nullable=False)
     user_id = Column(Integer, nullable=False)
-    recorded_at = Column(DateTime, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    recorded_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(CST))
     device = relationship("Device")
     __table_args__ = (Index("idx_logs_device", "device_id"), Index("idx_logs_recorded_at", "recorded_at"))
 
@@ -60,7 +66,7 @@ class MetricAIAnalysis(Base):
     __tablename__ = "metric_ai_analysis"
     device_id = Column(Integer, ForeignKey("devices.id"), nullable=False)
     metric_key = Column(String(50), nullable=False)
-    calc_time = Column(DateTime, default=datetime.utcnow, nullable=False)
+    calc_time = Column(DateTime(timezone=True), default=lambda: datetime.now(CST), nullable=False)
     model_version = Column(String(20), nullable=False)
     rul_days = Column(Integer)
     trend_r2 = Column(Float)
@@ -72,3 +78,24 @@ class MetricAIAnalysis(Base):
         PrimaryKeyConstraint("device_id", "metric_key", "calc_time", name="pk_metric_ai"),
         Index("idx_metric_ai_latest", "device_id", "metric_key"),
     )
+
+
+class equipmentAndAssetManagement(Base):
+    __tablename__ = "equipment_and_asset_management"
+
+    id = Column(Integer, primary_key=True)
+    device_id = Column(Integer, ForeignKey("device.id"), nullable=False)    # 关联设备
+    serial_number = Column(String(100), unique=True, nullable=False)    # 序列号/资产编码
+    asset_code = Column(String(100), nullable=True)
+    location = Column(String(100))  # 位置/产线/区域
+    status = Column(String(100), default="activate", nullable=False)    # 运行/停机/激活等
+    vender = Column(String(100), nullable=True)     # 供应商
+    brand = Column(String(100))     # 品牌
+    model_revision = Column(String(100))    # 型号版本
+    installed_at = Column(DateTime) # 安装日期
+    commissioned_at = Column(DateTime)  # 投运日期
+    warranty_end = Column(DateTime) # 保修到期
+    maintenance_contract_id = Column(String(100))   # 维保合同ID
+    management_team = Column(String(100))   # 责任班组
+    maintain_manual_id = Column(Integer)    # 维护人/工号
+    
