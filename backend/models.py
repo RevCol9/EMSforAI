@@ -1,23 +1,11 @@
-from sqlalchemy import (
-    Column,
-    Integer,
-    String,
-    Float,
-    Boolean,
-    DateTime,
-    ForeignKey,
-    JSON,
-    Text,
-    PrimaryKeyConstraint,
-    Index,
-)
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, JSON, Index, PrimaryKeyConstraint
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from .db import Base
 
 
-class DeviceType(Base):
-    __tablename__ = "device_types"
+class DeviceModel(Base):
+    __tablename__ = "device_models"
     id = Column(Integer, primary_key=True)
     name = Column(String(100), unique=True, nullable=False)
 
@@ -25,15 +13,16 @@ class DeviceType(Base):
 class Device(Base):
     __tablename__ = "devices"
     id = Column(Integer, primary_key=True)
-    device_type_id = Column(Integer, ForeignKey("device_types.id"), nullable=False)
+    model_id = Column(Integer, ForeignKey("device_models.id"), nullable=False)
     name = Column(String(100), unique=True, nullable=False)
-    device_type = relationship("DeviceType")
+    model = relationship("DeviceModel")
+    __table_args__ = (Index("idx_devices_model", "model_id"),)
 
 
 class DeviceMetricDefinition(Base):
     __tablename__ = "device_metric_definitions"
     id = Column(Integer, primary_key=True)
-    device_type_id = Column(Integer, ForeignKey("device_types.id"), nullable=False)
+    model_id = Column(Integer, ForeignKey("device_models.id"), nullable=False)
     metric_key = Column(String(50), nullable=False)
     metric_name = Column(String(50), nullable=False)
     unit = Column(String(20))
@@ -45,10 +34,8 @@ class DeviceMetricDefinition(Base):
     trend_direction = Column(Integer, default=1)
     weight_in_health = Column(Float, default=1.0)
     is_ai_analyzed = Column(Boolean, default=True)
-    device_type = relationship("DeviceType")
-    __table_args__ = (
-        Index("idx_metric_def_device_type_key", "device_type_id", "metric_key", unique=True),
-    )
+    model = relationship("DeviceModel")
+    __table_args__ = (Index("idx_metric_def_model_key", "model_id", "metric_key", unique=True),)
 
 
 class InspectionLog(Base):
@@ -59,10 +46,7 @@ class InspectionLog(Base):
     recorded_at = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     device = relationship("Device")
-    __table_args__ = (
-        Index("idx_logs_device", "device_id"),
-        Index("idx_logs_recorded_at", "recorded_at"),
-    )
+    __table_args__ = (Index("idx_logs_device", "device_id"), Index("idx_logs_recorded_at", "recorded_at"))
 
 
 class InspectionMetricValue(Base):
@@ -88,4 +72,3 @@ class MetricAIAnalysis(Base):
         PrimaryKeyConstraint("device_id", "metric_key", "calc_time", name="pk_metric_ai"),
         Index("idx_metric_ai_latest", "device_id", "metric_key"),
     )
-

@@ -3,6 +3,15 @@ from datetime import datetime
 from pydantic import BaseModel
 
 
+class DeviceModelCreate(BaseModel):
+    name: str
+
+
+class DeviceCreate(BaseModel):
+    name: str
+    model_id: int
+
+
 class InspectionSubmit(BaseModel):
     device_id: int
     user_id: int
@@ -40,4 +49,3 @@ class DeviceOverview(BaseModel):
     device_id: int
     health_score: float
     metrics: List[MetricOverviewItem]
-

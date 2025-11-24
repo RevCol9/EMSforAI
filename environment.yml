@@ -1,0 +1,15 @@
+name: emsforai
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - fastapi
+  - uvicorn
+  - sqlalchemy
+  - pydantic
+  - aiofiles
+  - python-dotenv
+  - alembic
+  - pip
+  - pip:
+      - fastapi-cli

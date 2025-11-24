@@ -11,9 +11,9 @@ except Exception:
 
 class EquipmentAnalyzer:
     def __init__(self, history_data: List[Dict[str, float]]):
-        self.data = sorted(history_data, key=lambda x: x["date"])
+        self.data = sorted(history_data, key=lambda x: x["date"]) if history_data else []
         self.dates = [datetime.strptime(d["date"], "%Y-%m-%d") for d in self.data]
-        self.values = np.array([float(d["value"]) for d in self.data])
+        self.values = np.array([float(d["value"]) for d in self.data]) if self.data else np.empty(0)
         self.base_date = self.dates[0] if self.dates else None
         self.x = (
             np.array([(d - self.base_date).total_seconds() / 86400.0 for d in self.dates]).reshape(-1, 1)
@@ -32,12 +32,10 @@ class EquipmentAnalyzer:
         r2 = 1.0 - ss_res / ss_tot
         return slope, intercept, r2
 
-    def predict_rul(
-        self,
-        limit_threshold: float,
-        trend_direction: int = 1,
-        max_days: int = 365,
-    ) -> Dict[str, Optional[int]]:
+    def predict_rul(self, 
+                    limit_threshold: float, 
+                    trend_direction: int = 1, 
+                    max_days: int = 365) -> Dict[str, Optional[int]]:
         if len(self.values) < 3 or self.base_date is None:
             return {"status": "insufficient", "rul_days": None}
         res = self._lin_reg()
@@ -74,12 +72,7 @@ class EquipmentAnalyzer:
             result.append({"date": d.date().isoformat(), "value": round(float(yi), 2)})
         return result
 
-    def detect_input_anomaly(
-        self,
-        new_value: float,
-        valid_min: Optional[float] = None,
-        valid_max: Optional[float] = None,
-    ) -> bool:
+    def detect_input_anomaly(self, new_value: float, valid_min: Optional[float] = None, valid_max: Optional[float] = None) -> bool:
         if valid_min is not None and new_value < valid_min:
             return True
         if valid_max is not None and new_value > valid_max:
@@ -89,4 +82,3 @@ class EquipmentAnalyzer:
         mean = float(np.mean(self.values))
         std = float(np.std(self.values)) or 1e-6
         return abs(new_value - mean) > 3.0 * std
-
