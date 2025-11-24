@@ -5,11 +5,17 @@ from pydantic import BaseModel
 
 class DeviceModelCreate(BaseModel):
     name: str
+    manufacturer: str | None = None
+    description: str | None = None
 
 
 class DeviceCreate(BaseModel):
     name: str
     model_id: int
+    serial_number: str | None = None
+    location: str | None = None
+    status: str | None = None
+    last_service_date: datetime | None = None
 
 
 class InspectionSubmit(BaseModel):

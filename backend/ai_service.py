@@ -1,12 +1,14 @@
 from typing import List, Dict, Optional
-import numpy as np
+import importlib.util
 from datetime import datetime, timedelta
 
-try:
-    from scipy.interpolate import CubicSpline
-    HAS_SCIPY = True
-except Exception:
-    HAS_SCIPY = False
+import numpy as np
+
+HAS_SCIPY = importlib.util.find_spec("scipy.interpolate") is not None
+if HAS_SCIPY:
+    from scipy.interpolate import CubicSpline  # type: ignore
+else:
+    CubicSpline = None
 
 
 class EquipmentAnalyzer:

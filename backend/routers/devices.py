@@ -24,7 +24,7 @@ def create_device_model(payload: schemas.DeviceModelCreate, db: Session = Depend
     if db.execute(exists_stmt).scalar_one_or_none():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Model already exists")
 
-    model = models.DeviceModel(name=payload.name)
+    model = models.DeviceModel(name=payload.name, manufacturer=payload.manufacturer, description=payload.description)
     db.add(model)
     db.commit()
     db.refresh(model)
@@ -44,7 +44,16 @@ def create_device(payload: schemas.DeviceCreate, db: Session = Depends(get_db_se
     if not model:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device model not found")
 
-    device = models.Device(name=payload.name, model_id=payload.model_id)
+    serial_number = payload.serial_number or payload.name
+    status_val = payload.status or "active"
+    device = models.Device(
+        name=payload.name,
+        model_id=payload.model_id,
+        serial_number=serial_number,
+        location=payload.location,
+        status=status_val,
+        last_service_date=payload.last_service_date,
+    )
     db.add(device)
     db.commit()
     db.refresh(device)

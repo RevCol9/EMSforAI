@@ -6,7 +6,14 @@ from sqlalchemy import select, desc
 from datetime import datetime
 
 from .db import SessionLocal, engine, Base
-from .models import DeviceModel, Device, DeviceMetricDefinition, InspectionLog, InspectionMetricValue, MetricAIAnalysis
+from .models import (
+    DeviceModel,
+    Device,
+    DeviceMetricDefinition,
+    InspectionLog,
+    InspectionMetricValue,
+    MetricAIAnalysis,
+)
 from .schemas import DeviceModelCreate, DeviceCreate, InspectionSubmit, InspectionSubmitResponse, MetricAIResponse, CurvePoint, DeviceOverview, MetricOverviewItem
 from .ai_service import EquipmentAnalyzer
 
@@ -37,7 +44,7 @@ def recommendations():
 
 @app.post("/devices/models")
 def create_device_model(payload: DeviceModelCreate, db: Session = Depends(get_db)):
-    m = DeviceModel(name=payload.name)
+    m = DeviceModel(name=payload.name, manufacturer=payload.manufacturer, description=payload.description)
     db.add(m)
     db.commit()
     db.refresh(m)
@@ -52,7 +59,16 @@ def list_device_models(db: Session = Depends(get_db)):
 
 @app.post("/devices")
 def create_device(payload: DeviceCreate, db: Session = Depends(get_db)):
-    d = Device(name=payload.name, model_id=payload.model_id)
+    serial_number = payload.serial_number or payload.name
+    status = payload.status or "active"
+    d = Device(
+        name=payload.name,
+        model_id=payload.model_id,
+        serial_number=serial_number,
+        location=payload.location,
+        status=status,
+        last_service_date=payload.last_service_date,
+    )
     db.add(d)
     db.commit()
     db.refresh(d)
