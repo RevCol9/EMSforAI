@@ -16,3 +16,6 @@ dependencies:
   - pip:
       - fastapi-cli
       - psycopg2-binary
+      - xgboost
+      - scikit-learn
+      - pandas

@@ -1,0 +1,218 @@
+{
+    "device_models": [
+        {
+            "name": "CNC-VM-500"
+        },
+        {
+            "name": "AIR-COMP-75kW"
+        }
+    ],
+    "devices": [
+        {
+            "name": "VM-500-A01",
+            "model_id": 1,
+            "serial_number": "VM500-20231108-A01",
+            "location": "Line1-Station3",
+            "status": "active"
+        },
+        {
+            "name": "COMP-75-01",
+            "model_id": 2,
+            "serial_number": "AC75-20231001-01",
+            "location": "Utility-Room-2",
+            "status": "active"
+        }
+    ],
+    "device_metric_definitions": [
+        {
+            "model_id": 1,
+            "metric_key": "spindle_vibration",
+            "metric_name": "主轴振动",
+            "unit": "mm/s",
+            "base_unit": "mm/s",
+            "display_unit": "mm/s",
+            "unit_scale": 1.0,
+            "unit_offset": 0,
+            "decimal_precision": 2,
+            "data_type": "float",
+            "warn_threshold": 4.5,
+            "crit_threshold": 7.0,
+            "valid_min": 0.0,
+            "valid_max": 15.0,
+            "trend_direction": 1,
+            "weight_in_health": 1.2,
+            "is_ai_analyzed": true,
+            "sampling_frequency": 1.0,
+            "collection_source": "IoT",
+            "collector_id": "SENSOR-VIB-AX1",
+            "standard_code": "ISO 10816",
+            "alarm_delay_seconds": 30,
+            "criticality": "high",
+            "data_origin": "raw",
+            "validation_required": true,
+            "feature_snapshot": {
+                "axis": "X",
+                "mount": "housing"
+            },
+            "prediction_confidence": null,
+            "min_sampling_interval": 1,
+            "max_sampling_interval": 60
+        },
+        {
+            "model_id": 1,
+            "metric_key": "spindle_temp",
+            "metric_name": "主轴温度",
+            "unit": "°C",
+            "base_unit": "°C",
+            "display_unit": "°C",
+            "unit_scale": 1.0,
+            "unit_offset": 0,
+            "decimal_precision": 1,
+            "data_type": "float",
+            "warn_threshold": 70.0,
+            "crit_threshold": 85.0,
+            "valid_min": 0.0,
+            "valid_max": 120.0,
+            "trend_direction": 1,
+            "weight_in_health": 1.0,
+            "is_ai_analyzed": true,
+            "sampling_frequency": 0.2,
+            "collection_source": "IoT",
+            "collector_id": "SENSOR-TEMP-SPD",
+            "standard_code": "GB/T 2951",
+            "alarm_delay_seconds": 60,
+            "criticality": "medium",
+            "data_origin": "raw",
+            "validation_required": true,
+            "feature_snapshot": {
+                "position": "bearing_front"
+            },
+            "prediction_confidence": null,
+            "min_sampling_interval": 5,
+            "max_sampling_interval": 300
+        }
+    ],
+    "inspection_submits": [
+        {
+            "device_id": 1,
+            "user_id": 101,
+            "recorded_at": "2025-01-10T09:15:00+08:00",
+            "metrics": {
+                "spindle_vibration": 3.2,
+                "spindle_temp": 62.5
+            },
+            "data_origin": "IoT",
+            "collector_id": "GW-EDGE-01",
+            "data_quality_score": 0.93,
+            "validation_notes": "自动采集，无缺失"
+        },
+        {
+            "device_id": 1,
+            "user_id": 101,
+            "recorded_at": "2025-01-17T09:20:00+08:00",
+            "metrics": {
+                "spindle_vibration": 4.8,
+                "spindle_temp": 68.0
+            },
+            "data_origin": "IoT",
+            "collector_id": "GW-EDGE-01",
+            "data_quality_score": 0.91,
+            "validation_notes": "自动采集，温度接近预警"
+        }
+    ],
+    "metric_ai_analysis": [
+        {
+            "device_id": 1,
+            "metric_key": "spindle_vibration",
+            "calc_time": "2025-01-17T09:25:00+08:00",
+            "model_version": "v1",
+            "rul_days": 25,
+            "trend_r2": 0.78,
+            "last_value": 4.8,
+            "curve_points": [
+                {
+                    "date": "2025-01-03",
+                    "value": 3.1
+                },
+                {
+                    "date": "2025-01-10",
+                    "value": 3.2
+                },
+                {
+                    "date": "2025-01-17",
+                    "value": 4.8
+                }
+            ],
+            "extra_info": {
+                "status": "warn"
+            },
+            "health_score": 72.5,
+            "prediction_confidence": 0.7,
+            "feature_snapshot": {
+                "axis": "X",
+                "mount": "housing"
+            },
+            "alert_level": "warning",
+            "alert_status": "open",
+            "acknowledged_at": null,
+            "ack_by": null,
+            "downtime_risk": 0.35,
+            "throughput_impact": 0.15
+        }
+    ],
+    "equipment_and_asset_management": [
+        {
+            "device_id": 1,
+            "serial_number": "VM500-20231108-A01",
+            "asset_code": "ASM-001",
+            "location": "Line1-Station3",
+            "status": "active",
+            "vendor": "Makino",
+            "brand": "Makino",
+            "model_revision": "RevB",
+            "installed_at": "2023-11-08T00:00:00+08:00",
+            "commissioned_at": "2023-11-15T00:00:00+08:00",
+            "warranty_end": "2026-11-08T00:00:00+08:00",
+            "maintenance_contract_id": "MC-2024-001",
+            "management_team": "ME-Team-A",
+            "maintainer_id": 501
+        }
+    ],
+    "spare_usage_cycles": [
+        {
+            "device_id": 1,
+            "part_code": "BRG-6205",
+            "usage_cycles": 1200
+        }
+    ],
+    "energy_consumption": [
+        {
+            "device_id": 2,
+            "recorded_at": "2025-01-17T00:00:00+08:00",
+            "energy_kwh": 280.5,
+            "gas_nm3": null,
+            "water_ton": 1.8,
+            "source": "EnergyMeter-AC75"
+        }
+    ],
+    "oee_stats": [
+        {
+            "device_id": 1,
+            "period_start": "2025-01-10T00:00:00+08:00",
+            "period_end": "2025-01-10T23:59:59+08:00",
+            "availability": 0.92,
+            "performance": 0.88,
+            "quality_rate": 0.98
+        }
+    ],
+    "maintenance_costs": [
+        {
+            "device_id": 1,
+            "period_start": "2025-01-01T00:00:00+08:00",
+            "period_end": "2025-01-31T23:59:59+08:00",
+            "cost": 3200.0,
+            "budget_center": "PLANT-A-MAINT",
+            "note": "更换主轴轴承+润滑"
+        }
+    ]
+}

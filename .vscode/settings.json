@@ -11,6 +11,20 @@
             "group": "EMSforAI",
             "database": "emsforai",
             "username": "ems"
+        },
+        {
+            "ssh": "Disabled",
+            "previewLimit": 50,
+            "server": "36.139.175.84",
+            "port": 9001,
+            "sshOptions": {
+                "port": 22
+            },
+            "driver": "PostgreSQL",
+            "group": "EMSforAI",
+            "name": "pgSQL-remote",
+            "database": "emsforai",
+            "username": "emsforai"
         }
     ]
 }

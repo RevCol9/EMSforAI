@@ -1,0 +1,18 @@
+[
+  {
+    "device_id": 1,
+    "serial_number": "VM500-20231108-A01",
+    "asset_code": "ASM-001",
+    "location": "Line1-Station3",
+    "status": "active",
+    "vendor": "Makino",
+    "brand": "Makino",
+    "model_revision": "RevB",
+    "installed_at": "2023-11-08T00:00:00+08:00",
+    "commissioned_at": "2023-11-15T00:00:00+08:00",
+    "warranty_end": "2026-11-08T00:00:00+08:00",
+    "maintenance_contract_id": "MC-2024-001",
+    "management_team": "ME-Team-A",
+    "maintainer_id": 501
+  }
+]

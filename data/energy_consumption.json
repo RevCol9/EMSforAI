@@ -1,0 +1,10 @@
+[
+  {
+    "device_id": 2,
+    "recorded_at": "2025-01-17T00:00:00+08:00",
+    "energy_kwh": 280.5,
+    "gas_nm3": null,
+    "water_ton": 1.8,
+    "source": "EnergyMeter-AC75"
+  }
+]

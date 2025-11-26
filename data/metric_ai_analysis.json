@@ -1,0 +1,26 @@
+[
+  {
+    "device_id": 1,
+    "metric_key": "spindle_vibration",
+    "calc_time": "2025-01-17T09:25:00+08:00",
+    "model_version": "v1",
+    "rul_days": 25,
+    "trend_r2": 0.78,
+    "last_value": 4.8,
+    "curve_points": [
+      { "date": "2025-01-03", "value": 3.1 },
+      { "date": "2025-01-10", "value": 3.2 },
+      { "date": "2025-01-17", "value": 4.8 }
+    ],
+    "extra_info": { "status": "warn" },
+    "health_score": 72.5,
+    "prediction_confidence": 0.7,
+    "feature_snapshot": { "axis": "X", "mount": "housing" },
+    "alert_level": "warning",
+    "alert_status": "open",
+    "acknowledged_at": null,
+    "ack_by": null,
+    "downtime_risk": 0.35,
+    "throughput_impact": 0.15
+  }
+]
