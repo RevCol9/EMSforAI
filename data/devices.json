@@ -1,0 +1,16 @@
+[
+  {
+    "name": "VM-500-A01",
+    "model_id": 1,
+    "serial_number": "VM500-20231108-A01",
+    "location": "Line1-Station3",
+    "status": "active"
+  },
+  {
+    "name": "COMP-75-01",
+    "model_id": 2,
+    "serial_number": "AC75-20231001-01",
+    "location": "Utility-Room-2",
+    "status": "active"
+  }
+]

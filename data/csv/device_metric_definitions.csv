@@ -1,0 +1,8 @@
+id,model_id,metric_key,metric_name,unit,warn_threshold,crit_threshold,valid_min,valid_max,trend_direction,weight_in_health,is_ai_analyzed,sampling_frequency,collection_source,collector_id,standard_code,alarm_delay_seconds,criticality,data_origin,validation_required,feature_snapshot,min_sampling_interval,max_sampling_interval,decimal_precision,base_unit,display_unit,unit_scale,unit_offset,data_type
+1,1,spindle_vibration,主轴振动,mm/s,4.5,7.0,0.0,15.0,1,1.2,true,1.0,IoT,SENSOR-VIB-AX1,ISO 10816,30,high,raw,true,"{""axis"":""X"",""mount"":""housing""}",1,60,2,mm/s,mm/s,1.0,0,float
+2,1,spindle_temp,主轴温度,°C,70.0,85.0,0.0,120.0,1,1.0,true,0.2,IoT,SENSOR-TEMP-SPD,GB/T 2951,60,medium,raw,true,"{""position"":""bearing_front""}",5,300,1,°C,°C,1.0,0,float
+3,2,compressor_pressure,压缩机排气压力,MPa,0.78,0.95,0.0,1.2,1,1.2,true,0.1,IoT,SENSOR-PRS-01,ISO 1217,45,high,raw,true,"{""stage"":""LP"",""mode"":""continuous""}",10,120,3,MPa,MPa,1.0,0,float
+4,2,compressor_discharge_temp,压缩机排气温度,°C,95.0,110.0,0.0,150.0,1,1.0,true,0.1,IoT,SENSOR-TEMP-DIS,ISO 1217,60,medium,raw,true,"{""position"":""aftercooler_inlet""}",10,300,1,°C,°C,1.0,0,float
+5,2,motor_bearing_vibration,电机轴承振动,mm/s,3.5,6.5,0.0,12.0,1,1.0,true,0.2,IoT,SENSOR-VIB-MOT,ISO 10816,30,medium,raw,true,"{""bearing"":""drive_end""}",5,120,2,mm/s,mm/s,1.0,0,float
+6,3,lathe_spindle_vibration,车床主轴振动,mm/s,3.8,6.0,0.0,12.0,1,1.1,true,1.0,IoT,SENSOR-VIB-LAT,ISO 10816,30,high,raw,true,"{""axis"":""Z"",""mount"":""headstock""}",1,60,2,mm/s,mm/s,1.0,0,float
+7,3,lathe_spindle_temp,车床主轴温度,°C,65.0,80.0,0.0,120.0,1,1.0,true,0.2,IoT,SENSOR-TEMP-LAT,GB/T 2951,60,medium,raw,true,"{""position"":""rear_bearing""}",5,300,1,°C,°C,1.0,0,float

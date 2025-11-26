@@ -1,0 +1,3 @@
+device_id,metric_key,calc_time,model_version,rul_days,trend_r2,last_value,health_score,prediction_confidence,alert_level,alert_status,downtime_risk,throughput_impact,feature_snapshot,extra_info
+1,spindle_vibration,2025-01-31T09:30:00+08:00,v1,18,0.82,6.2,58.0,0.78,warning,open,0.42,0.21,"{""axis"":""X"",""mount"":""housing""}","{""status"":""warn""}"
+2,compressor_pressure,2025-01-26T08:30:00+08:00,v1,25,0.79,0.91,64.0,0.72,warning,open,0.38,0.19,"{""stage"":""LP""}","{""status"":""rising""}"

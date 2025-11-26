@@ -1,0 +1,28 @@
+[
+  {
+    "device_id": 1,
+    "user_id": 101,
+    "recorded_at": "2025-01-10T09:15:00+08:00",
+    "metrics": {
+      "spindle_vibration": 3.2,
+      "spindle_temp": 62.5
+    },
+    "data_origin": "IoT",
+    "collector_id": "GW-EDGE-01",
+    "data_quality_score": 0.93,
+    "validation_notes": "自动采集，无缺失"
+  },
+  {
+    "device_id": 1,
+    "user_id": 101,
+    "recorded_at": "2025-01-17T09:20:00+08:00",
+    "metrics": {
+      "spindle_vibration": 4.8,
+      "spindle_temp": 68.0
+    },
+    "data_origin": "IoT",
+    "collector_id": "GW-EDGE-01",
+    "data_quality_score": 0.91,
+    "validation_notes": "自动采集，温度接近预警"
+  }
+]

@@ -1,0 +1,10 @@
+[
+  {
+    "device_id": 1,
+    "period_start": "2025-01-10T00:00:00+08:00",
+    "period_end": "2025-01-10T23:59:59+08:00",
+    "availability": 0.92,
+    "performance": 0.88,
+    "quality_rate": 0.98
+  }
+]
