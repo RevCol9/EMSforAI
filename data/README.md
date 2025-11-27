@@ -10,3 +10,4 @@
 - `energy_consumption.json`：能耗计量
 - `oee_stats.json`：OEE 统计
 - `maintenance_costs.json`：维护成本
+
