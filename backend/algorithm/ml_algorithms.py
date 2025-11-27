@@ -1,16 +1,19 @@
 # coding:utf-8
+import logging
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd, json
 from pathlib import Path
+from backend.algorithm.data_service import load_data_from_csv, prepare_metric_series
 
 
-CRIT_WEIGHT = {"high": 1.2, "medium": 1.0, "low": 0.8}
-
-BASE_DIR = Path(__file__).resolve().parents[2]
-CSV_PATH = BASE_DIR / "data" / "csv"
+logging.basicConfig(
+    level=logging.INFO,  
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+log = logging.getLogger()
 
 
 @dataclass
@@ -22,74 +25,73 @@ class TrendResults:
     y_items: np.ndarray
 
 
-def load_data_from_csv(base=CSV_PATH) -> pd.DataFrame:
-    """Load all CSVs and parse JSON-ish columns."""
-    return {
-        "device_metric_definitions": pd.read_csv(f"{base}/device_metric_definitions.csv").assign(
-            feature_snapshot=lambda df: df["feature_snapshot"].apply(
-                lambda x: json.loads(x) if isinstance(x, str) else x)
-        ),
-        "device_models": pd.read_csv(f"{base}/device_models.csv"),
-        "devices": pd.read_csv(f"{base}/devices.csv"),
-        "energy_consumption": pd.read_csv(f"{base}/energy_consumption.csv"),
-        "equipment_and_asset_management": pd.read_csv(f"{base}/equipment_and_asset_management.csv"),
-        "inspection_submits": pd.read_csv(f"{base}/inspection_submits.csv", parse_dates=['recorded_at']).assign(
-            # 对 CSV 里的 metrics 列,逐个检查转换每个单元格: str -> Dict,List
-            metrics=lambda df: df["metrics"].apply(lambda x: json.loads(x) if isinstance(x, str) else x),
-            data_origin=lambda df: df.get("data_origin", "IoT"),
-            data_quality_score=lambda df: df.get("data_quality_score", 1.0),
-            validation_notes=lambda df: df.get("validation_notes", "")
-        ),
-        "maintenance_costs": pd.read_csv(f"{base}/maintenance_costs.csv", parse_dates=['period_start', 'period_end']),
-        "metric_ai_analysis": pd.read_csv(f"{base}/metric_ai_analysis.csv", parse_dates=['calc_time']).assign(
-            curve_points=lambda df: df["curve_points"].apply(lambda x: json.loads(x) if isinstance(x, str) else x),
-            extra_info=lambda df: df["extra_info"].apply(lambda x: json.loads(x) if isinstance(x, str) else x),
-            feature_snapshot=lambda df: df["feature_snapshot"].apply(
-                lambda x: json.loads(x) if isinstance(x, str) else x)
-        ),
-        "oee_stats": pd.read_csv(f"{base}/oee_stats.csv", parse_dates=['period_start', 'period_end']),
-        "spare_usage_cycles": pd.read_csv(f"{base}/spare_usage_cycles.csv")
-    }
-
-
-# 数据准备
-def prepare_metric_series(
-        data, metric_key, device_id=None, window_days=30, safety_Confidence=0.8
-) -> pd.DataFrame:
-    df_irf = data["inspection_submits"]
-    if device_id is not None:
-        df_irf = df_irf[df_irf["device_id"] == device_id]
-    # copy
-    df_irf = df_irf.copy()
-    df_irf["value"] = df_irf["metrics"].apply(
-        lambda line: float(line.get(metric_key, np.nan)) if isinstance(line, dict) else np.nan
-    )
-    df_irf["quality"] = df_irf["data_quality_score"].fillna(0.8) if "data_quality_score" in df_irf else 0.8
-    # 去掉空值
-    df_irf = df_irf.dropna(subset=["value"])
-    # convert datetime
-    df_irf["record_time"] = pd.to_datetime(df_irf["recorded_at"])
-    # window filter
-    cutoff = df_irf["record_time"].max() - pd.Timedelta(days=window_days)
-    df_irf = df_irf[(df_irf["record_time"] >= cutoff) & (df_irf["quality"] >= safety_Confidence)]
-    return df_irf.sort_values("record_time")[["record_time", "quality"]]
-
 
 # 线性回归
 def linearRegression(df: pd.DataFrame) -> Optional[TrendResults]:
-    required_cols = {"record_time", "quality"}
-    if not required_cols.issubset(df.columns):
-        raise KeyError(f"linearRegression 输入缺少列: {required_cols - set(df.columns)}")
-    # 可靠性检验
-    if len(df) < 3:
-        return None
-    t0 = df["record_time"].min()
-    t_days = (df["record_time"] - t0).dt.total_seconds() / 86400.0
-    print(t_days)
+    '''最小二乘直线拟合: return beta, alpha, R^2'''
+    try:
+        required_cols = {"record_time", "quality"}
+        if not required_cols.issubset(df.columns):
+            raise KeyError(f"linearRegression 输入缺少列: {required_cols - set(df.columns)}")
+        # 可靠性检验
+        if len(df) < 3:
+            return None
+        t0 = df["record_time"].min()
+        t_days = (df["record_time"] - t0).dt.total_seconds() / 86400.0
+        # print(t_days)
+        y = df["value"].astype(float).to_numpy()
+        # 中心化
+        t_center = t_days - t_days.mean()
+        y_center = y - y.mean()
+        denominator = np.sum(t_center ** 2)
+        if denominator == 0:
+            return None
+        
+        beta = float(sum(t_center * y_center) / denominator)  # β
+        alpha = float(y.mean() - beta * t_days.mean())  # α
+        y_fitting = alpha + beta * t_days
+        s_res = float(np.sum((y - y_fitting) ** 2))  # 计算残差平方和
+        s_tot = float(np.sum((y - y.mean()) ** 2)) or 1e-6  # 计算总平方和
+        r2 = 1.0 - s_res / s_tot    # 决定系数
+
+        log.info(f'R^2: {r2}')
+        return TrendResults(
+            alpha=alpha, beta=beta, R2=r2, t_days=t_days.to_numpy(), y_items=y
+        )
+    except ArithmeticError as ae:
+        log.info(f"failed to linear regression : {ae}")
+
+
+# 机器剩余寿命RUL
+def estimate_rul(df: Dict, trend: TrendResults, max_days: int=365) -> Any:
+    '''基于线性趋势的撞线时间,即何时撞见最大阈值c'''
+    d = df["trend_direction"]  # 恶化方向
+    z_c = d * df["crit_threshold"]
+    # 趋势参数映射到统一坐标系 z
+    alpha_z = d * trend.alpha
+    beta_z = d * trend.beta
+    t_now = np.asarray(trend.t_days)[-1]
+    if beta_z <= 0:
+        return None, "状态稳定"
+    t_end = (z_c - alpha_z) / beta_z   # 撞线时间
+    rul = t_end - t_now
+    if rul <= 0:
+        return 0, "设备寿命已经结束"
+    if rul > max_days:
+        return max_days, "长期安全"
+    return int(rul), "正在衰退"
+
+# 
 
 
 if __name__ == "__main__":
     data = load_data_from_csv()
-    series_df = prepare_metric_series(data=data, metric_key="spindle_vibration")
-    test2 = linearRegression(df=series_df)
-    print(test2)
+    reg_df = prepare_metric_series(data=data, metric_key="spindle_vibration")
+    # dmd = prepare_metric_series(data=data, metric_key="crit_threshold")
+    trend = linearRegression(df=reg_df, metric_key="device_metric_definitions")
+    rul1 = estimate_rul(df=dmd, trend=TrendResults)
+    if trend:
+        print(f"alpha={trend.alpha:.2f}, beta={trend.beta:.4f}, R2={trend.R2:.5f}")
+
+
+
