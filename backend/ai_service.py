@@ -82,3 +82,4 @@ class EquipmentAnalyzer:
         mean = float(np.mean(self.values))
         std = float(np.std(self.values)) or 1e-6
         return abs(new_value - mean) > 3.0 * std
+
