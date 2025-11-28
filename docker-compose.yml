@@ -5,16 +5,18 @@ services:
     image: postgres:15
     container_name: ems-postgres
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      POSTGRES_USER: ems
-      POSTGRES_PASSWORD: ems
-      POSTGRES_DB: emsforai
+      POSTGRES_USER: ${POSTGRES_USER:-ems}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-emsforai}
     ports:
       - "5432:5432"
     volumes:
       - pgdata_ems:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ems -d emsforai"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ems} -d ${POSTGRES_DB:-emsforai}"]
       interval: 10s
       timeout: 5s
       retries: 5
