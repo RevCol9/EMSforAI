@@ -34,6 +34,7 @@ JSON_FIELDS: Dict[str, List[str]] = {
     "device_metric_definitions": ["feature_snapshot"],
     "inspection_submits": ["metrics"],
     "metric_ai_analysis": ["curve_points", "extra_info", "feature_snapshot"],
+    "inspection_metric_values": ["metrics_data"],
 }
 
 # 时间列定义，便于读取时自动转为 datetime
@@ -44,7 +45,7 @@ DATE_FIELDS: Dict[str, List[str]] = {
     "oee_stats": ["period_start", "period_end"],
 }
 
-# 默认需要加载的表名列表（主要用于 DB 和 metadata 兜底）
+# 默认需要加载的表名列表
 DEFAULT_TABLES: List[str] = [
     "device_metric_definitions",
     "device_models",
@@ -52,6 +53,8 @@ DEFAULT_TABLES: List[str] = [
     "energy_consumption",
     "equipment_and_asset_management",
     "inspection_submits",
+    "inspection_logs",
+    "inspection_metric_values",
     "maintenance_costs",
     "metric_ai_analysis",
     "oee_stats",
@@ -180,7 +183,9 @@ def _get_data_from_db(
         "devices": models.Device,
         "energy_consumption": models.EnergyConsumption,
         "equipment_and_asset_management": models.EquipmentAndAssetManagement,
-        "inspection_submits": models.InspectionLog,  # 日志表替代 inspection_submits
+        "inspection_submits": models.InspectionLog,  # CSV 兼容字段
+        "inspection_logs": models.InspectionLog,
+        "inspection_metric_values": models.InspectionMetricValue,
         "maintenance_costs": models.MaintenanceCost,
         "metric_ai_analysis": models.MetricAIAnalysis,
         "oee_stats": models.OEEStat,
@@ -279,6 +284,69 @@ def load_data_from_csv(
 ) -> Dict[str, pd.DataFrame]:
     result = get_data(source_type="csv", tables=tables, base=base, verbose=verbose)
     return result["data"]
+
+
+def load_data_from_db(
+    tables: Optional[Iterable[str]] = None,
+    session: Optional[Session] = None,
+    db_engine: Optional[Engine] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> Dict[str, pd.DataFrame]:
+    result = get_data(
+        source_type="db",
+        tables=tables,
+        session=session,
+        db_engine=db_engine,
+        limit=limit,
+        offset=offset,
+    )
+    data = result["data"]
+    return _ensure_inspection_submits(data)
+
+
+def _ensure_inspection_submits(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    """
+    Ensure data bundle contains inspection_submits dataframe similar to CSV dataset.
+    - If DB only has inspection_logs + inspection_metric_values, compose them.
+    - If inspection_submits exists but没有 metrics 列，也会用 logs+metric_values 重建。
+    """
+    logs_df = None
+    if "inspection_submits" in data:
+        # 兼容：如果已有 CSV 风格的数据且包含 metrics 列，直接返回
+        existing = data["inspection_submits"]
+        if "metrics" in existing.columns:
+            return data
+        logs_df = existing
+    if logs_df is None:
+        logs_df = data.get("inspection_logs") or data.get("inspection_submits")
+    if logs_df is None or logs_df.empty:
+        return data
+
+    logs_df = logs_df.copy()
+    metrics_df = data.get("inspection_metric_values")
+    if metrics_df is not None and not metrics_df.empty:
+        merged = logs_df.merge(
+            metrics_df,
+            left_on="id",
+            right_on="log_id",
+            how="left",
+            suffixes=("", "_metric"),
+        )
+        merged["metrics"] = merged.get("metrics_data", pd.Series([{}] * len(merged))).apply(
+            lambda val: val if isinstance(val, dict) else (val or {})
+        )
+        merged = merged.drop(columns=[col for col in ("log_id", "metrics_data") if col in merged.columns])
+    else:
+        merged = logs_df
+        merged["metrics"] = [{}] * len(merged)
+
+    # Align column name with CSV expectation
+    if "record_time" in merged.columns and "recorded_at" not in merged.columns:
+        merged = merged.rename(columns={"record_time": "recorded_at"})
+
+    data["inspection_submits"] = merged
+    return data
 
 
 def _normalize_series(values: pd.Series) -> pd.Series:
@@ -499,7 +567,7 @@ def aggregate_device_health(
 
 
 @contextmanager
-def transaction_scope(existing_session: Optional[Session] = None) -> Session:
+def transaction_scope(existing_session: Optional[Session] = None) -> Any:
     """
     事务上下文管理器，支持 with 使用，自动提交/回滚。
     """
