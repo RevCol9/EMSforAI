@@ -100,6 +100,8 @@ class MetricAnalysisResult(BaseModel):
     trend_beta: Optional[float] = None
     trend_r2: Optional[float] = None
     prediction_confidence: Optional[float] = Field(None, description="预测置信度 0-1")
+    weight_in_health: Optional[float] = Field(None, description="在设备健康度计算中的权重")
+    criticality: Optional[str] = Field(None, description="指标关键程度: high, medium, low")
 
 
 class SparePartInfo(BaseModel):
