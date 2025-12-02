@@ -427,7 +427,15 @@ class AlgorithmEngine(Engine):
                 maintenance_risk = 0.0
             else:
                 # 计算最近30天和历史均值的比率
-                recent_cutoff = pd.Timestamp.now() - pd.Timedelta(days=30)
+                # 确保时区一致性：如果 period_end 带时区，recent_cutoff 也要带时区
+                period_end_series = device_maintenance["period_end"]
+                if hasattr(period_end_series.dtype, 'tz') and period_end_series.dtype.tz is not None:
+                    # period_end 带时区，使用相同的时区
+                    tz = period_end_series.dtype.tz
+                    recent_cutoff = pd.Timestamp.now(tz=tz) - pd.Timedelta(days=30)
+                else:
+                    # period_end 不带时区，使用本地时间（不带时区）
+                    recent_cutoff = pd.Timestamp.now() - pd.Timedelta(days=30)
                 recent = device_maintenance[device_maintenance["period_end"] >= recent_cutoff]["cost"].sum()
                 historical_avg = device_maintenance["cost"].mean()
                 if historical_avg > 0:
