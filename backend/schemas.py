@@ -82,3 +82,52 @@ class DeviceOverview(BaseModel):
     device_id: int
     health_score: float
     metrics: List[MetricOverviewItem]
+
+
+# ========== 算法引擎 API 响应模型 ==========
+
+class MetricAnalysisResult(BaseModel):
+    """单指标分析结果"""
+    metric_key: str
+    device_id: Optional[int]
+    current_value: float
+    health_score: float
+    alert_level: str = Field(..., description="告警级别: normal, warning, critical")
+    data_points: int
+    rul_days: Optional[int] = None
+    rul_status: Optional[str] = None
+    trend_alpha: Optional[float] = None
+    trend_beta: Optional[float] = None
+    trend_r2: Optional[float] = None
+    prediction_confidence: Optional[float] = Field(None, description="预测置信度 0-1")
+
+
+class SparePartInfo(BaseModel):
+    """备件信息"""
+    spare_part_id: Optional[str] = None
+    spare_part_name: Optional[str] = None
+    part_code: Optional[str] = None
+    usage_cycles: int
+    max_cycles: int
+    usage_ratio: float
+    remaining_ratio: float
+    status: str = Field(..., description="状态: normal, warning, critical")
+
+
+class SpareLifeInfo(BaseModel):
+    """备件寿命信息"""
+    status: str
+    spare_parts: List[SparePartInfo]
+    total_parts: int
+    critical_count: int
+
+
+class DeviceAnalysisResponse(BaseModel):
+    """设备完整分析结果"""
+    device_id: int
+    device_health_score: float
+    device_alert_level: str
+    metrics: List[MetricAnalysisResult]
+    downtime_risk: float = Field(..., description="停机风险 0-1")
+    throughput_impact: float = Field(..., description="产能影响 0-1")
+    spare_life_info: SpareLifeInfo
