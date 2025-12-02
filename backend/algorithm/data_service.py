@@ -192,7 +192,7 @@ def _get_data_from_db(
         "spare_usage_cycles": models.SpareUsage,
     }
     if session is None:
-        # 使用传入的 db_engine 创建临时会话，保持与连接池/事务配置一致
+        # 根据传入的 db_engine 创建会话，确保连接池和事务配置一致
         if db_engine is None:
             local_session = SessionLocal()
         else:
