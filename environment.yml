@@ -13,9 +13,13 @@ dependencies:
   - python-dotenv
   - alembic
   - pip
+  - statsmodels
   - pip:
       - fastapi-cli
       - psycopg2-binary
       - xgboost
       - scikit-learn
       - pandas
+      - torch
+      - tqdm
+      - matplotlib

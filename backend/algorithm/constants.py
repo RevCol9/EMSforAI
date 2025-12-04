@@ -1,8 +1,17 @@
-"""Common constants for algorithm module."""
+"""
+EMSforAI 算法常量定义
 
+本模块定义了算法引擎使用的各种常量，包括权重系数、阈值等。
+
+Author: EMSforAI Team
+License: MIT
+"""
+
+# 关键程度权重系数
+# 用于在计算设备健康度时，根据指标的关键程度调整权重
 CRIT_WEIGHT = {
-    "high": 1.2,
-    "medium": 0.85,
-    "low": 0.5,
+    "high": 1.2,      # 高关键程度：权重增加20%
+    "medium": 0.85,   # 中等关键程度：权重减少15%
+    "low": 0.5,       # 低关键程度：权重减少50%
 }
 

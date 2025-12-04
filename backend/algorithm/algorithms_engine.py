@@ -1,603 +1,1372 @@
-# coding:utf-8
-import sys
-import logging  
-import math  
+"""
+EMSforAI 算法引擎 V2 - LSTM 版
 
-from dataclasses import dataclass 
+1. 多维度健康评分，直接服务前端雷达图
+2. LSTM 驱动的剩余寿命（RUL）预测
+3. 标准化的时间序列与统计输出，方便折线图/统计图复用
+
+Author: EMSforAI Team
+License: MIT
+"""
+import logging  
+import sys
 from pathlib import Path  
-from typing import Any, Dict, Iterable, List, Optional, Tuple 
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
 
 import numpy as np  
 import pandas as pd  
-import json  
+from dataclasses import dataclass, field
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 if str(BASE_DIR) not in sys.path:
     sys.path.append(str(BASE_DIR))
 
-from backend.algorithm.base import Engine
-from backend.algorithm.constants import CRIT_WEIGHT
+SCIPY_AVAILABLE = False
+try:
+    from scipy import signal
+    from scipy.fft import fft, fftfreq
+    from scipy.stats import linregress
+    from scipy.optimize import curve_fit
+    SCIPY_AVAILABLE = True
+except ImportError:
+    pass
 
-# 基础日志配置
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+SKLEARN_AVAILABLE = False
+try:
+    # 仅用于传统回归/评分，不影响核心 LSTM 功能
+    from sklearn.linear_model import LinearRegression
+    from sklearn.preprocessing import PolynomialFeatures
+    from sklearn.metrics import r2_score
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    pass
+
+# LSTM模型
+LSTM_AVAILABLE = False
+try:
+    from backend.algorithm.lstm_model import LSTMRULPredictor, MultiVariateLSTMPredictor
+    LSTM_AVAILABLE = True
+except ImportError:
+    pass
+
 log = logging.getLogger(__name__)
 
 
 @dataclass
-class TrendResults:
-    alpha: float  
-    beta: float  
-    R2: float  
-    t_days: np.ndarray  
-    y_items: np.ndarray 
+class MetricDimensionScore:
+    """单个维度的健康评分（用于雷达图）"""
+    dimension_name: str  # 维度名称，如"温度"、"振动"等
+    metric_id: str  # 测点ID
+    health_score: float  # 0-100
+    current_value: float  # 当前值
+    warn_threshold: float  # 警告阈值
+    crit_threshold: float  # 临界阈值
+    trend: str  # 趋势：上升/下降/稳定
+    alert_level: str  # 告警级别：normal/warning/critical
 
 
-def build_metrics_for_aggregation(metrics_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Extract minimal fields required for device_multi_indicator_health."""
-    payload: List[Dict[str, Any]] = []
-    for metric in metrics_results:
-        payload.append(
-            {
-                "health_score": metric["health_score"],
-                "weight_in_health": metric.get("weight_in_health", 1.0),
-                "criticality": metric.get("criticality", "medium"),
-                "alert_level": metric.get("alert_level", "normal"),
-            }
-        )
-    return payload
+@dataclass
+class TimeSeriesPoint:
+    """时间序列数据点（用于曲线图）"""
+    timestamp: str  # ISO格式时间字符串
+    value: float  # 数值
+    smoothed_value: Optional[float] = None  # 平滑后的值（可选）
 
 
-class AlgorithmEngine(Engine):
-
-    def __init__(self, window_days: int = 30, quality_cutoff: float = 0.8) -> None:
-        super().__init__(window_days=window_days, quality_cutoff=quality_cutoff)
-        self.window_days = window_days
-        self.quality_cutoff = quality_cutoff
-
-    # 数据加载/预处理
-    def load(self, data_bundle: Dict[str, Any]) -> Dict[str, Any]:
-        """透传数据，在此做缓存/索引预处理。"""
-        return data_bundle
-
-    def analyze_metric(self, context: Any, defn: Dict[str, Any], device_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        """
-        分析单个设备指标
-        
-        执行指标健康度评估、趋势分析和剩余使用寿命(RUL)预测
-        
-        Args:
-            context: 数据上下文，包含所有数据表的字典
-            defn: 指标定义字典，必须包含 metric_key, warn_threshold, crit_threshold 等字段
-            device_id: 设备ID，如果指定则只分析该设备的该指标
-            
-        Returns:
-            分析结果字典，包含健康度、趋势、RUL等信息；如果数据不足则返回 None
-        """
-        metric_key = defn.get("metric_key")
-        if not metric_key:
-            log.warning("指标定义中缺少 metric_key")
-            return None
-        
-        # 获取指标的时间序列数据
-        df_series = self.prepare_metric_series(context, metric_key, device_id)
-        
-        # 数据量检查：至少需要3个数据点才能进行趋势分析
-        if df_series.empty or len(df_series) < 3:
-            log.warning(f"指标: {metric_key} 数据量不足,无法进行分析")
-            return None
-        
-        # 获取最新记录值作为当前值
-        current_value = float(df_series["value"].iloc[-1])
-        health_score = self.compute_metric_health(defn=defn, current_val=current_value)
-        alert_level = self.metric_alert_level(defn, current_value)
-        trend = self.linear_regression(df_series)
-
-        result = {
-            "metric_key": metric_key,
-            "device_id": device_id,
-            "current_value": current_value,
-            "health_score": health_score,
-            "alert_level": alert_level,
-            "data_points": len(df_series),
-        }
-        if trend is not None:
-            rul_days, rul_status = self.compute_rul(defn=defn, trend=trend)
-            result["rul_days"] = rul_days
-            result["rul_status"] = rul_status
-            result["trend_alpha"] = trend.alpha
-            result["trend_beta"] = trend.beta
-            result["trend_r2"] = trend.R2
-            # 计算预测置信度：综合考虑样本数量和趋势拟合度
-            N = len(df_series)
-            N0 = 30  # 样本数量阈值，超过此值认为样本充足
-            prediction_confidence = min(1.0, N / N0) * trend.R2
-            result["prediction_confidence"] = round(prediction_confidence, 3)
-        else:
-            result["trend_alpha"] = None
-            result["trend_beta"] = None
-            result["trend_r2"] = None
-            result["rul_days"] = None
-            result["rul_status"] = "无法计算趋势"
-            result["prediction_confidence"] = 0.0
-        return result
+@dataclass
+class TrendAnalysis:
+    """趋势分析结果"""
+    slope: float  # 趋势斜率
+    intercept: float  # 截距
+    r2: float  # R²值
+    p_value: Optional[float] = None  # p值（如果可用）
+    trend_type: str = "lstm"  # 趋势类型
+    model_name: str = "LSTM"  # 使用的模型名称
 
 
-    def analyze_device(self, context: Any, device_id: Optional[int] = None) -> Dict[str, Any]:
-        """针对设备聚合多个指标的分析结果
-        
-        Args:
-            context: 数据上下文(data_bundle)，包含所有数据表的字典
-            device_id: 设备ID，如果为 None 则分析所有设备
-            
-        Returns:
-            设备分析结果字典，包含设备健康度、各指标分析结果等
-        """
-        defs_df = context.get("device_metric_definitions", pd.DataFrame()) 
-        devices_df = context.get("devices", pd.DataFrame())
-        if defs_df.empty:
-            log.warning("指标定义为空，无法进行分析")
-            return {
-            "device_id": device_id,
-            "device_health_score": 0.0,
-            "device_alert_level": "数据不足",
-            "metrics": [],
-            }
-        
-        if device_id is not None:
-            # 获取设备型号id
-            device_row = devices_df[devices_df["id"] == device_id]
-            if device_row.empty:
-                log.warning(f"设备 {device_id} 不存在")
-                return {
-                    "device_id": device_id,
-                    "device_health_score": 0.0,
-                    "device_alert_level": "设备不存在",
-                    "metrics": [],   
-                }
-            model_id = device_row.iloc[0]["model_id"]
-            # 获取当前型号的指标定义
-            defs_df = defs_df[defs_df["model_id"] == model_id]
-        
-        # 按行遍历每个指标分析
-        metrics_results = []
-        for _, metric_row in defs_df.iterrows():
-            # 构建指标定义字典 for analyze_metric: {}
-            metric_def = {
-                "metric_key": metric_row["metric_key"],
-                "warn_threshold": metric_row.get("warn_threshold"),
-                "crit_threshold": metric_row.get("crit_threshold"),
-                "trend_direction": metric_row.get("trend_direction"),
-                "weight_in_health": metric_row.get("weight_in_health", 1.0),
-                "criticality": metric_row.get("criticality", "medium"),
-            }
-            metric_data = self.analyze_metric(context=context, defn=metric_def, device_id=device_id)
-            if metric_data is not None:
-                metric_data["weight_in_health"] = metric_def["weight_in_health"]
-                metric_data["criticality"] = metric_def["criticality"]
-                metrics_results.append(metric_data)
-        
-        if not metrics_results:
-            log.warning(f"设备 {device_id} 无可用的指标分析结果")
-            return {
-                "device_id": device_id,
-                "device_health_score": 0.0,
-                "device_alert_level": "无可用数据",
-                "metrics": [],
-            }
-
-        # 聚合metric列表 for device_multi_indicator_health
-        metrics_for_aggregation = build_metrics_for_aggregation(metrics_results)
-        device_health_score, device_alert = self.device_multi_indicator_health(metrics_for_aggregation)
-
-        # 计算高级功能（停机风险、产能影响、备件寿命）
-        downtime_risk = self.compute_downtime_risk(context, device_id, device_health_score, metrics_results)
-        throughput_impact = self.compute_throughput_impact(context, device_id, device_health_score, downtime_risk)
-        spare_life_info = self.compute_spare_life(context, device_id)
-
-        return {
-            "device_id": device_id,
-            "device_health_score": device_health_score,
-            "device_alert_level": device_alert,
-            "metrics": metrics_results,
-            "downtime_risk": downtime_risk,
-            "throughput_impact": throughput_impact,
-            "spare_life_info": spare_life_info,
-        }
-
-
-    # 数据准备：抽取目标指标
-    def prepare_metric_series(
-        self,
-        data: Dict[str, Any],
-        metric_key: str,
-        device_id: Optional[int] = None,
-    ) -> pd.DataFrame:
-        df = data["inspection_submits"] 
-        if device_id is not None:
-            df = df[df["device_id"] == device_id]  # 按设备过滤
-
-        df = df.copy()  # 避免修改原数据
-        df["value"] = df["metrics"].apply(
-            lambda line: float(line.get(metric_key, np.nan)) if isinstance(line, dict) else np.nan
-        )  # 抽取目标指标
-        df["quality"] = df["data_quality_score"].fillna(0.8) if "data_quality_score" in df else 0.8  # 质量评分
-        df = df.dropna(subset=["value"])  # 去掉空值
-        df["record_time"] = pd.to_datetime(df["recorded_at"])  # 转换 datetime
-        cutoff = df["record_time"].max() - pd.Timedelta(days=self.window_days)  # 滑窗起点
-        df = df[(df["record_time"] >= cutoff) & (df["quality"] >= self.quality_cutoff)]  # 滤窗口和质量
-        return df.sort_values("record_time")[["record_time", "value", "quality"]] 
-
-    def linear_regression(self, df: pd.DataFrame) -> Optional[TrendResults]:
-        """
-        执行线性回归分析，计算趋势参数和拟合度
-        
-        使用最小二乘法拟合时间序列数据，返回趋势斜率、截距和决定系数(R²)
-        
-        Args:
-            df: 包含 record_time 和 value 列的 DataFrame
-            
-        Returns:
-            TrendResults 对象，包含回归参数；如果数据不足则返回 None
-        """
-        # 样本量检查：至少需要3个数据点
-        if len(df) < 3:  
-            return None
-        
-        t0 = df["record_time"].min()  # 起始时间作为基准点
-        t_days = (df["record_time"] - t0).dt.total_seconds() / 86400.0  # 转换为天数
-        y = df["value"].astype(float).to_numpy()
-        
-        # 中心化处理：提高数值稳定性
-        t_center = t_days - t_days.mean()
-        y_center = y - y.mean()
-        
-        # 计算斜率 beta
-        denom = np.sum(t_center ** 2)
-        if denom == 0:
-            return None
-        beta = float(np.sum(t_center * y_center) / denom)  
-        alpha = float(y.mean() - beta * t_days.mean())  # 截距
-        
-        # 计算决定系数 R²
-        y_hat = alpha + beta * t_days
-        ss_res = float(np.sum((y - y_hat) ** 2))  # 残差平方和
-        ss_tot = float(np.sum((y - y.mean()) ** 2)) or 1e-6  # 总平方和
-        r2 = 1.0 - ss_res / ss_tot
-        
-        log.info(f"线性回归完成: R² = {r2:.3f}, 斜率 = {beta:.6f}")
-        return TrendResults(alpha=alpha, beta=beta, R2=r2, t_days=t_days.to_numpy(), y_items=y)
-
-    def compute_rul(self, defn: Dict[str, Any], trend: TrendResults, max_days: int = 365) -> Any:
-        """
-        计算剩余使用寿命 (Remaining Useful Life, RUL)
-        
-        基于线性趋势预测指标达到临界阈值所需的时间
-        
-        Args:
-            defn: 指标定义，包含 trend_direction 和 crit_threshold
-            trend: 线性回归趋势结果
-            max_days: RUL 的最大值限制（天）
-            
-        Returns:
-            (rul_days, status) 元组，rul_days 为剩余天数，status 为状态描述
-        """
-        d = defn["trend_direction"]  # 趋势方向：1 表示上升趋势，-1 表示下降趋势
-        z_c = d * defn["crit_threshold"]  # 临界阈值（统一坐标系）
-        
-        # 将趋势参数映射到统一坐标系
-        alpha_z = d * trend.alpha  
-        beta_z = d * trend.beta  
-        t_now = trend.t_days[-1]  # 当前时间点
-        
-        # 如果趋势稳定（斜率 <= 0），无法预测 RUL
-        if beta_z <= 0: 
-            return None, "状态稳定"
-        
-        # 计算达到临界阈值的时间点
-        t_star = (z_c - alpha_z) / beta_z
-        rul = t_star - t_now
-        
-        if rul <= 0:
-            return 0, "设备寿命已经结束"
-        if rul > max_days:
-            return max_days, "长期安全"
-        return int(rul), "正在衰退"
-
-    @staticmethod
-    def compute_metric_health(defn: Dict[str, Any], current_val: float) -> float:
-        """
-        计算单指标健康度分数 (0-100)
-        
-        基于当前值与警告阈值、临界阈值的线性插值计算健康度
-        
-        Args:
-            defn: 指标定义，包含 trend_direction, warn_threshold, crit_threshold
-            current_val: 当前指标值
-            
-        Returns:
-            健康度分数，范围 0-100，100 表示完全健康
-        """
-        d = defn["trend_direction"]
-        z = d * current_val  # 统一坐标系下的当前值
-        z_w = d * defn["warn_threshold"]  # 警告阈值
-        z_c = d * defn["crit_threshold"]  # 临界阈值
-        
-        # 线性插值：计算当前值在警告和临界阈值之间的位置
-        s = (z - z_w) / (z_c - z_w)
-        ss = np.clip(s, 0.0, 1.0)  # 限制在 [0, 1] 范围内
-        return round(100.0 * (1.0 - ss), 1)  # 转换为 0-100 分数
-
-    @staticmethod
-    def metric_alert_level(defn: Dict[str, Any], current_value: float) -> str:
-        """
-        判断指标告警级别
-        
-        Args:
-            defn: 指标定义，包含 trend_direction, warn_threshold, crit_threshold
-            current_value: 当前指标值
-            
-        Returns:
-            告警级别："normal", "warning", "critical"
-        """
-        d = defn["trend_direction"]
-        w = d * current_value  # 统一坐标系下的当前值
-        if w >= d * defn["crit_threshold"]:
-            return "critical"
-        if w >= d * defn["warn_threshold"]:
-            return "warning"
-        return "normal"
+@dataclass
+class HealthAnalysisResult:
+    """健康分析结果（增强版）"""
+    health_score: float  # 0-100，总体健康分
+    rul_days: Optional[float]  # 剩余寿命天数
+    trend_slope: float  # 平均趋势斜率
+    diagnosis_result: Dict[str, float]  # 诊断概率
+    prediction_confidence: float  # 预测置信度 0-1
+    model_version: str = "2.0"
     
-    @staticmethod   
-    def device_multi_indicator_health(metrics: List[Dict[str, Any]]) -> Any:
+    # 新增：多维度评分（用于雷达图）
+    dimension_scores: List[MetricDimensionScore] = field(default_factory=list)
+    
+    # 新增：时间序列数据（用于曲线图）
+    time_series_data: Dict[str, List[TimeSeriesPoint]] = field(default_factory=dict)
+    
+    # 新增：统计信息（用于统计图）
+    statistics: Dict[str, Any] = field(default_factory=dict)
+
+
+class AlgorithmEngine:
+    """
+    算法引擎主类（V2 - LSTM 增强版）
+    
+    负责执行设备健康分析的所有算法，针对实际生产数据进行优化：
+    - 多维度健康评分（支持雷达图）
+    - 智能 RUL 预测（LSTM 神经网络 + 传统回归模型）
+    - 时间序列分析（趋势、周期、异常提取）
+    - 前端友好的数据结构（适配可视化需求）
+    """
+    
+    def _get_or_load_multivariate_lstm_model(self, asset_id: str) -> Optional[MultiVariateLSTMPredictor]:
         """
-        计算设备多指标综合健康度
-        
-        基于加权平均方法聚合多个指标的健康度，权重由指标重要性和关键程度决定
+        获取或加载多变量LSTM模型（一个设备一个模型）
         
         Args:
-            metrics: 指标分析结果列表，每个元素包含 health_score, weight_in_health, criticality, alert_level
+            asset_id: 设备ID
+        
+        Returns:
+            MultiVariateLSTMPredictor 实例，如果模型不存在或加载失败则返回 None
+        """
+        if not LSTM_AVAILABLE:
+            return None
+        
+        # 检查缓存
+        if asset_id in self._multivariate_lstm_cache:
+            return self._multivariate_lstm_cache[asset_id]
+        
+        # 模型不在缓存中，尝试加载
+        models_dir = BASE_DIR / "models" / "lstm"
+        model_path = models_dir / f"{asset_id}_multivariate_lstm.pt"
+        
+        if not model_path.exists():
+            log.debug(f"多变量LSTM模型不存在: {model_path}")
+            return None
+        
+        try:
+            predictor = MultiVariateLSTMPredictor()
+            predictor.load_model(str(model_path))
+            # 加载成功后缓存
+            self._multivariate_lstm_cache[asset_id] = predictor
+            log.debug(f"多变量LSTM模型已加载并缓存: {asset_id}")
+            return predictor
+        except Exception as e:
+            log.warning(f"加载多变量LSTM模型失败 {asset_id}: {e}")
+            return None
+    
+    def _try_multivariate_lstm_prediction(
+        self,
+        data: Dict[str, pd.DataFrame],
+        asset_id: str,
+        metric_ids: List[str],
+        crit_thresholds: Dict[str, float],
+    ) -> Optional[Tuple[Optional[float], TrendAnalysis]]:
+        """
+        尝试使用多变量LSTM模型进行RUL预测
+        
+        Args:
+            data: 数据字典
+            asset_id: 设备ID
+            metric_ids: 测点ID列表（模型训练时使用的测点）
+            crit_thresholds: 每个测点的临界阈值字典
+        
+        Returns:
+            (rul_days, trend_analysis) 或 None（如果多变量LSTM不可用）
+        """
+        if not LSTM_AVAILABLE:
+            return None
+        
+        try:
+            # 使用缓存机制获取或加载模型
+            predictor = self._get_or_load_multivariate_lstm_model(asset_id)
+            if predictor is None:
+                return None
+            
+            # 准备每个测点的时间序列数据
+            from backend.algorithm.data_service import prepare_process_series
+            
+            metric_data = {}
+            for metric_id in metric_ids:
+                if metric_id not in predictor.feature_names:
+                    log.warning(f"测点 {metric_id} 不在模型的特征列表中，跳过")
+                    continue
+                
+                df = prepare_process_series(
+                    data,
+                    metric_id,
+                    asset_id=asset_id,
+                    window_days=self.window_days,
+                    machine_state=self.machine_state_filter,
+                    quality_threshold=self.quality_threshold,
+                )
+                
+                if df.empty or len(df) < predictor.sequence_length:
+                    log.debug(f"测点 {metric_id} 数据不足，跳过")
+                    return None
+                
+                df = df.sort_values("timestamp")
+                metric_data[metric_id] = df["value"].values
+            
+            if not metric_data:
+                log.debug("没有足够的测点数据用于多变量LSTM预测")
+                return None
+            
+            # 标准化数据
+            data_dict_scaled = predictor.transform_multivariate_values(metric_data)
+            
+            # 构建推理张量
+            X_input = predictor.build_multivariate_inference_tensor(data_dict_scaled)
+            
+            # 预测RUL
+            rul_predicted_scaled = predictor.predict(X_input)[0]
+            
+            # 反缩放RUL（从[0,1]恢复到天数）
+            from backend.algorithm.training_utils import MAX_RUL_DAYS
+            rul_predicted = rul_predicted_scaled * MAX_RUL_DAYS
+            
+            # 计算趋势（使用关键测点的数据）
+            key_metric = metric_ids[0]  # 使用第一个测点计算趋势
+            if key_metric in metric_data:
+                values = metric_data[key_metric]
+                if len(values) >= 10 and SCIPY_AVAILABLE:
+                    t_days = np.arange(len(values))
+                    slope, intercept, r_value, _, _ = linregress(t_days[-30:], values[-30:])
+                    r2 = r_value ** 2
+                else:
+                    slope = 0.0
+                    intercept = values[-1] if len(values) > 0 else 0.0
+                    r2 = 0.0
+            else:
+                slope = 0.0
+                intercept = 0.0
+                r2 = 0.0
+            
+            # 创建趋势分析对象
+            trend_analysis = TrendAnalysis(
+                slope=float(slope),
+                intercept=float(intercept),
+                r2=float(r2),
+                trend_type="multivariate_lstm",
+                model_name="MultiVariateLSTM",
+            )
+            
+            # 确保RUL非负
+            rul_days = max(0.0, float(rul_predicted))
+            
+            return rul_days, trend_analysis
+            
+        except Exception as e:
+            log.warning(f"多变量LSTM预测失败: {e}")
+            import traceback
+            log.debug(traceback.format_exc())
+            return None
+    
+    def _try_lstm_prediction(
+        self,
+        df: pd.DataFrame,
+        asset_id: str,
+        metric_id: str,
+        crit_threshold: float,
+    ) -> Optional[Tuple[Optional[float], TrendAnalysis]]:
+        """
+        尝试使用LSTM模型进行RUL预测（使用模型缓存）
             
         Returns:
-            (health_score, alert_level) 元组，health_score 为综合健康度分数，alert_level 为最高告警级别
+            (rul_days, trend_analysis) 或 None（如果LSTM不可用）
         """
-        weighted_sum = 0.0
-        weight_total = 0.0
-        alert = "正常"
+        if not LSTM_AVAILABLE:
+            return None
         
-        for m in metrics:
-            # 复合权重 = 基础权重 × 关键程度系数
-            composite_weight = m.get("weight_in_health", 1.0) * CRIT_WEIGHT.get(m.get("criticality", "medium"), 1.0)
-            weighted_sum += composite_weight * m["health_score"]
-            weight_total += composite_weight
+        try:
+            # 使用缓存机制获取或加载模型
+            predictor = self._get_or_load_lstm_model(asset_id, metric_id)
+            if predictor is None:
+                return None
             
-            # 确定最高告警级别
-            if m["alert_level"] == "critical":
-                alert = "SOS: critical"
-            elif m["alert_level"] == "warning" and alert != "critical":
-                alert = "warning: Note!"
+            df = df.sort_values("timestamp")
+            values = df["value"].values
+            
+            if len(values) < predictor.sequence_length:
+                log.debug(
+                    "数据点不足，模型需要至少%s个点，当前只有%s个",
+                    predictor.sequence_length,
+                    len(values),
+                )
+                return None
+            
+            values_scaled = predictor.transform_values(values.reshape(-1, 1))
+            X_input = predictor.build_inference_tensor(values_scaled)
+            
+            rul_predicted = predictor.predict(X_input)[0]
+            
+            # 计算趋势（使用最近的数据点）
+            # 注意：需要检查 SCIPY_AVAILABLE，因为 linregress 来自 scipy.stats
+            if len(values) >= 10 and SCIPY_AVAILABLE:
+                t_days = np.arange(len(values))
+                slope, intercept, r_value, _, _ = linregress(t_days[-30:], values[-30:])
+                r2 = r_value ** 2
+            else:
+                # 数据点不足或 scipy 不可用时，使用简单的默认趋势
+                if len(values) < 10:
+                    log.debug("数据点不足（<10），使用默认趋势")
+                if not SCIPY_AVAILABLE:
+                    log.debug("scipy 不可用，使用默认趋势")
+                slope = 0.0
+                intercept = values[-1] if len(values) > 0 else 0.0
+                r2 = 0.0
+            
+            # 创建趋势分析对象
+            trend_analysis = TrendAnalysis(
+                slope=float(slope),
+                intercept=float(intercept),
+                r2=float(r2),
+                trend_type="lstm",
+                model_name="LSTM",
+            )
+            
+            # 确保RUL非负
+            rul_days = max(0.0, float(rul_predicted))
+            
+            return rul_days, trend_analysis
+            
+        except Exception as e:
+            log.warning(f"LSTM预测失败: {e}")
+            import traceback
+            log.debug(traceback.format_exc())
+            return None
+    
+    def __init__(
+        self,
+        window_days: int = 30,
+        quality_threshold: int = 1,
+        machine_state_filter: Optional[int] = 2,  # 默认只分析加工状态
+        preload_lstm_models: bool = False,  # 是否预加载所有LSTM模型
+    ):
+        """
+        初始化算法引擎
         
-        # 加权平均计算综合健康度
-        health_score = round(weighted_sum / weight_total, 1) if weight_total else 0.0
-        return health_score, alert
+        Args:
+            window_days: 分析窗口天数
+            quality_threshold: 数据质量阈值（0或1）
+            machine_state_filter: 工况状态过滤（None=不过滤，2=只分析加工状态）
+            preload_lstm_models: 是否预加载所有LSTM模型（True=启动时加载，False=按需加载并缓存）
+        """
+        self.window_days = window_days
+        self.quality_threshold = quality_threshold
+        self.machine_state_filter = machine_state_filter
+        
+        # LSTM模型缓存：
+        # - 单变量模型：key为 (asset_id, metric_id)，value为 LSTMRULPredictor 实例
+        # - 多变量模型：key为 asset_id，value为 MultiVariateLSTMPredictor 实例
+        self._lstm_model_cache: Dict[Tuple[str, str], LSTMRULPredictor] = {}
+        self._multivariate_lstm_cache: Dict[str, MultiVariateLSTMPredictor] = {}
+        
+        # 如果启用预加载，扫描并加载所有可用的LSTM模型
+        if preload_lstm_models and LSTM_AVAILABLE:
+            self._preload_all_lstm_models()
+    
+    def _preload_all_lstm_models(self):
+        """
+        预加载所有可用的LSTM模型到内存缓存
+        
+        扫描 models/lstm/ 目录，加载所有 .pt 模型文件。
+        适用于需要频繁使用多个模型的场景，可以提升响应速度。
+        """
+        if not LSTM_AVAILABLE:
+            return
+        
+        models_dir = BASE_DIR / "models" / "lstm"
+        if not models_dir.exists():
+            log.debug("LSTM模型目录不存在，跳过预加载")
+            return
+        
+        # 扫描所有 .pt 文件
+        model_files = list(models_dir.glob("*_*_lstm.pt"))
+        log.info(f"发现 {len(model_files)} 个LSTM模型文件，开始预加载...")
+        
+        loaded_count = 0
+        for model_path in model_files:
+            try:
+                # 从文件名解析 asset_id 和 metric_id
+                # 格式：{asset_id}_{metric_id}_lstm.pt
+                filename = model_path.stem  # 去掉 .pt 后缀
+                if not filename.endswith("_lstm"):
+                    continue
+                
+                parts = filename.replace("_lstm", "").rsplit("_", 1)
+                if len(parts) != 2:
+                    log.warning(f"无法解析模型文件名: {model_path.name}")
+                    continue
+                
+                asset_id, metric_id = parts
+                cache_key = (asset_id, metric_id)
+                
+                # 如果已经缓存，跳过
+                if cache_key in self._lstm_model_cache:
+                    continue
+                
+                # 加载模型
+                predictor = LSTMRULPredictor()
+                predictor.load_model(str(model_path))
+                self._lstm_model_cache[cache_key] = predictor
+                loaded_count += 1
+                log.debug(f"预加载LSTM模型: {asset_id}/{metric_id}")
+                
+            except Exception as e:
+                log.warning(f"预加载LSTM模型失败 {model_path.name}: {e}")
+        
+        log.info(f"LSTM模型预加载完成: {loaded_count}/{len(model_files)} 个模型已加载")
+    
+    def _get_or_load_lstm_model(self, asset_id: str, metric_id: str) -> Optional[LSTMRULPredictor]:
+        """
+        获取或加载LSTM模型（带缓存）
+        
+        如果模型已在缓存中，直接返回；否则加载并缓存。
+        
+        Args:
+            asset_id: 设备ID
+            metric_id: 测点ID
+        
+        Returns:
+            LSTMRULPredictor 实例，如果模型不存在或加载失败则返回 None
+        """
+        if not LSTM_AVAILABLE:
+            return None
+        
+        cache_key = (asset_id, metric_id)
+        
+        # 检查缓存
+        if cache_key in self._lstm_model_cache:
+            return self._lstm_model_cache[cache_key]
+        
+        # 模型不在缓存中，尝试加载
+        models_dir = BASE_DIR / "models" / "lstm"
+        model_path = models_dir / f"{asset_id}_{metric_id}_lstm.pt"
+        
+        if not model_path.exists():
+            log.debug(f"LSTM模型不存在: {model_path}")
+            return None
+        
+        try:
+            predictor = LSTMRULPredictor()
+            predictor.load_model(str(model_path))
+            # 加载成功后缓存
+            self._lstm_model_cache[cache_key] = predictor
+            log.debug(f"LSTM模型已加载并缓存: {asset_id}/{metric_id}")
+            return predictor
+        except Exception as e:
+            log.warning(f"加载LSTM模型失败 {asset_id}/{metric_id}: {e}")
+            return None
+    
+    def analyze_health_score(
+        self,
+        data: Dict[str, pd.DataFrame],
+        asset_id: str,
+        metric_ids: Optional[List[str]] = None,
+    ) -> Tuple[float, List[MetricDimensionScore]]:
+        """
+        计算健康分（多维度评分）
+        
+        算法流程：
+        1. 提取所有PROCESS类型测点的最新值
+        2. 为每个测点计算健康分（基于阈值）
+        3. 按维度分组（温度、振动、负载等）
+        4. 计算总体健康分（加权平均）
+        
+        Returns:
+            (总体健康分, 维度评分列表)
+        """
+        metric_defs = data.get("metric_definitions", pd.DataFrame())
+        process_df = data.get("telemetry_process", pd.DataFrame())
+        
+        if metric_defs.empty or process_df.empty:
+            log.warning(f"设备 {asset_id} 缺少测点定义或过程数据")
+            return 50.0, []
+        
+        # 过滤设备相关的测点
+        asset_metrics = metric_defs[
+            (metric_defs["asset_id"] == asset_id) &
+            (metric_defs["metric_type"] == "PROCESS")
+        ]
+        
+        if metric_ids:
+            asset_metrics = asset_metrics[asset_metrics["metric_id"].isin(metric_ids)]
+        
+        if asset_metrics.empty:
+            log.warning(f"设备 {asset_id} 没有PROCESS类型的测点")
+            return 50.0, []
+        
+        dimension_scores = []
+        dimension_health_scores = {}  # 按维度分组
+        
+        for _, metric in asset_metrics.iterrows():
+            metric_id = metric["metric_id"]
+            metric_name = metric.get("metric_name", metric_id)
+            warn_threshold = metric.get("warn_threshold")
+            crit_threshold = metric.get("crit_threshold")
+            
+            if warn_threshold is None or crit_threshold is None:
+                continue
+            
+            # 获取最新值（过滤质量和工况）
+            df = process_df[
+                (process_df["metric_id"] == metric_id) &
+                (process_df["quality"] >= self.quality_threshold)
+            ]
+            
+            if self.machine_state_filter is not None and "machine_state" in process_df.columns:
+                df = df[df["machine_state"] == self.machine_state_filter]
+            
+            if df.empty:
+                continue
+            
+            # 获取时间窗口内的数据
+            max_time = df["timestamp"].max()
+            cutoff = max_time - pd.Timedelta(days=self.window_days)
+            df_window = df[df["timestamp"] >= cutoff]
+            
+            if df_window.empty:
+                continue
+            
+            # 计算当前值（使用最近N个值的平均值，减少噪声）
+            recent_values = df_window["value"].tail(min(10, len(df_window)))
+            current_value = float(recent_values.mean())
 
-    def compute_downtime_risk(
+            # 计算健康分（基于阈值）
+            if current_value >= crit_threshold:
+                health_score = 0.0
+                alert_level = "critical"
+            elif current_value >= warn_threshold:
+                # 警告区间：线性插值
+                health_score = 100.0 * (1.0 - (current_value - warn_threshold) / (crit_threshold - warn_threshold))
+                alert_level = "warning"
+            else:
+                health_score = 100.0
+                alert_level = "normal"
+            
+            # 计算趋势（简单线性回归）
+            if len(df_window) >= 3:
+                df_window = df_window.sort_values("timestamp")
+                t_days = (df_window["timestamp"] - df_window["timestamp"].min()).dt.total_seconds() / 86400.0
+                y = df_window["value"].values
+                
+                try:
+                    slope, intercept, r_value, p_value, std_err = linregress(t_days.values, y)
+                    if abs(slope) < 1e-6:
+                        trend = "稳定"
+                    elif slope > 0:
+                        trend = "上升"
+                    else:
+                        trend = "下降"
+                except:
+                    trend = "未知"
+            else:
+                trend = "未知"
+            
+            # 确定维度名称（从测点名称提取）
+            dimension_name = self._extract_dimension_name(metric_name, metric_id)
+            
+            # 创建维度评分
+            dim_score = MetricDimensionScore(
+                dimension_name=dimension_name,
+                metric_id=metric_id,
+                health_score=round(health_score, 1),
+                current_value=round(current_value, 2),
+                warn_threshold=float(warn_threshold),
+                crit_threshold=float(crit_threshold),
+                trend=trend,
+                alert_level=alert_level,
+            )
+            
+            dimension_scores.append(dim_score)
+            
+            # 按维度分组（同一维度取最低分）
+            if dimension_name not in dimension_health_scores:
+                dimension_health_scores[dimension_name] = []
+            dimension_health_scores[dimension_name].append(health_score)
+        
+        # 计算总体健康分（按维度加权，每个维度取最低分）
+        if dimension_health_scores:
+            # 每个维度取最低分（最差维度决定整体）
+            dimension_min_scores = [min(scores) for scores in dimension_health_scores.values()]
+            overall_health_score = np.mean(dimension_min_scores)
+        else:
+            overall_health_score = 50.0
+        
+        return round(overall_health_score, 1), dimension_scores
+    
+    def _extract_dimension_name(self, metric_name: str, metric_id: str) -> str:
+        """从测点名称提取维度名称"""
+        # 中文名称提取
+        if "温度" in metric_name:
+            return "温度"
+        elif "振动" in metric_name:
+            return "振动"
+        elif "负载" in metric_name or "LOAD" in metric_id:
+            return "负载"
+        elif "压力" in metric_name or "PRESSURE" in metric_id:
+            return "压力"
+        elif "流量" in metric_name or "FLOW" in metric_id:
+            return "流量"
+        elif "润滑" in metric_name or "LUBE" in metric_id:
+            return "润滑"
+        elif "进给" in metric_name or "FEED" in metric_id:
+            return "进给速度"
+        elif "冷却" in metric_name or "COOLANT" in metric_id:
+            return "冷却系统"
+        else:
+            return "其他"
+    
+    def analyze_rul(
+        self,
+        data: Dict[str, pd.DataFrame],
+        asset_id: str,
+        metric_id: str,
+        use_lstm: bool = True,
+        require_lstm: bool = False,
+    ) -> Tuple[Optional[float], TrendAnalysis, Optional[str]]:
+        """
+        预测剩余寿命（RUL）- LSTM增强版
+        
+        算法流程：
+        1. 如果use_lstm=True，优先尝试LSTM模型（如果已训练）
+        2. 如果LSTM不可用或use_lstm=False，使用传统模型：
+           - 时间序列预处理（去噪、平滑）
+           - 时间序列分解（趋势+周期+残差）
+           - 多模型拟合（线性、多项式、指数、分段线性）
+           - 选择最佳模型（基于R²）
+        3. 预测达到阈值的时间
+        
+        Args:
+            use_lstm: 是否使用LSTM模型（True=优先使用LSTM，False=仅使用传统模型）
+            require_lstm: 是否要求必须使用LSTM（True=如果没有LSTM模型则返回错误，False=自动回退到传统模型）
+            
+        Returns:
+            (rul_days, trend_analysis, error_message) 元组
+            - rul_days: 剩余寿命（天），如果无法预测则为None
+            - trend_analysis: 趋势分析结果
+            - error_message: 错误信息，如果require_lstm=True且没有LSTM模型则返回错误信息
+        """
+        from backend.algorithm.data_service import prepare_process_series
+        
+        # 准备时间序列
+        df = prepare_process_series(
+            data,
+            metric_id,
+            asset_id=asset_id,
+            window_days=self.window_days,
+            machine_state=self.machine_state_filter,
+            quality_threshold=self.quality_threshold,
+        )
+        
+        if df.empty or len(df) < 5:  # 至少需要5个点
+            return None, TrendAnalysis(slope=0.0, intercept=0.0, r2=0.0), None
+        
+        # 获取阈值
+        metric_defs = data.get("metric_definitions", pd.DataFrame())
+        metric_def = metric_defs[metric_defs["metric_id"] == metric_id]
+        
+        if metric_def.empty:
+            return None, TrendAnalysis(slope=0.0, intercept=0.0, r2=0.0), None
+        
+        crit_threshold = metric_def.iloc[0]["crit_threshold"]
+        if crit_threshold is None:
+            return None, TrendAnalysis(slope=0.0, intercept=0.0, r2=0.0), None
+        
+        # 尝试使用LSTM模型（优先多变量，然后单变量）
+        if use_lstm and LSTM_AVAILABLE:
+            # 首先尝试多变量LSTM模型（一个设备一个模型）
+            models_dir = BASE_DIR / "models" / "lstm"
+            multivariate_model_path = models_dir / f"{asset_id}_multivariate_lstm.pt"
+            
+            if multivariate_model_path.exists():
+                # 获取设备的所有测点
+                asset_metrics = metric_defs[
+                    (metric_defs["asset_id"] == asset_id) &
+                    (metric_defs["metric_type"] == "PROCESS")
+                ]
+                
+                if not asset_metrics.empty:
+                    # 获取所有测点的metric_id和crit_threshold
+                    all_metric_ids = asset_metrics["metric_id"].tolist()
+                    all_crit_thresholds = {
+                        row["metric_id"]: row["crit_threshold"]
+                        for _, row in asset_metrics.iterrows()
+                        if row["crit_threshold"] is not None
+                    }
+                    
+                    # 尝试使用多变量LSTM预测
+                    multivariate_result = self._try_multivariate_lstm_prediction(
+                        data, asset_id, all_metric_ids, all_crit_thresholds
+                    )
+                    
+                    if multivariate_result is not None:
+                        rul_days, trend_analysis = multivariate_result
+                        if rul_days is not None:
+                            log.info(f"使用多变量LSTM模型预测RUL: {rul_days:.1f}天 (R²={trend_analysis.r2:.3f})")
+                            return rul_days, trend_analysis, None
+            
+            # 多变量模型不存在或预测失败，尝试单变量LSTM模型
+            single_model_path = models_dir / f"{asset_id}_{metric_id}_lstm.pt"
+            
+            if not single_model_path.exists():
+                if require_lstm:
+                    error_msg = f"当前设备({asset_id})的测点({metric_id})暂无预训练LSTM模型（单变量或多变量）"
+                    log.warning(error_msg)
+                    return None, TrendAnalysis(slope=0.0, intercept=0.0, r2=0.0), error_msg
+                else:
+                    log.debug(f"LSTM模型不存在，回退到传统模型: {single_model_path}")
+            else:
+                # 单变量模型存在，尝试使用
+                lstm_result = self._try_lstm_prediction(df, asset_id, metric_id, crit_threshold)
+                if lstm_result is not None:
+                    rul_days, trend_analysis = lstm_result
+                    if rul_days is not None:
+                        log.info(f"使用单变量LSTM模型预测RUL: {rul_days:.1f}天 (R²={trend_analysis.r2:.3f})")
+                        return rul_days, trend_analysis, None
+        
+        # LSTM不可用或预测失败，使用传统模型
+        if use_lstm:
+            log.debug(f"LSTM不可用或预测失败，使用传统模型预测RUL")
+        else:
+            log.debug(f"使用传统模型预测RUL（use_lstm=False）")
+        
+        # 时间序列预处理
+        df = df.sort_values("timestamp")
+        t0 = df["timestamp"].min()
+        t_days = (df["timestamp"] - t0).dt.total_seconds() / 86400.0
+        y_raw = df["value"].values
+        
+        # 1. 数据平滑（使用Savitzky-Golay滤波器，保留趋势）
+        if len(y_raw) >= 7 and SCIPY_AVAILABLE:
+            try:
+                window_length = min(7, len(y_raw) // 2 * 2 - 1)  # 必须是奇数
+                if window_length >= 3:
+                    y_smooth = signal.savgol_filter(y_raw, window_length, 2)
+                else:
+                    y_smooth = y_raw
+            except:
+                y_smooth = y_raw
+        else:
+            # 简单移动平均
+            window_size = max(3, min(len(y_raw) // 10, 5))
+            if window_size > 1:
+                y_smooth = pd.Series(y_raw).rolling(window=window_size, center=True).mean()
+                y_smooth = y_smooth.bfill().ffill()
+                y_smooth = y_smooth.values
+            else:
+                y_smooth = y_raw
+        
+        y = y_smooth
+        
+        # 2. 时间序列分解（提取趋势和周期）
+        trend_component, seasonal_component = self._decompose_time_series(t_days.values, y)
+        
+        # 3. 多模型拟合
+        best_model = None
+        best_r2 = -np.inf
+        best_trend_analysis = None
+        
+        models_to_try = []
+        
+        # 3.1 线性回归
+        if SKLEARN_AVAILABLE:
+            try:
+                X = t_days.values.reshape(-1, 1)
+                model_linear = LinearRegression()
+                model_linear.fit(X, y)
+                y_pred = model_linear.predict(X)
+                r2_linear = r2_score(y, y_pred)
+                
+                models_to_try.append({
+                    "model": model_linear,
+                    "r2": r2_linear,
+                    "name": "LinearRegression",
+                    "type": "linear",
+                    "predict_func": lambda t: model_linear.predict(t.reshape(-1, 1)),
+                    "slope": float(model_linear.coef_[0]),
+                    "intercept": float(model_linear.intercept_),
+                })
+            except Exception as e:
+                log.debug(f"线性回归失败: {e}")
+        
+        # 3.2 多项式回归（2-4次）
+        if SKLEARN_AVAILABLE and len(y) >= 6:
+            for degree in [2, 3, 4]:
+                if len(y) < degree + 2:
+                    continue
+                try:
+                    poly_features = PolynomialFeatures(degree=degree, include_bias=False)
+                    X_poly = poly_features.fit_transform(X)
+                    model_poly = LinearRegression()
+                    model_poly.fit(X_poly, y)
+                    y_pred = model_poly.predict(X_poly)
+                    r2_poly = r2_score(y, y_pred)
+                    
+                    # 计算平均斜率
+                    t_pred = np.linspace(t_days.min(), t_days.max(), 100)
+                    y_pred_curve = model_poly.predict(poly_features.transform(t_pred.reshape(-1, 1)))
+                    slope = (y_pred_curve[-1] - y_pred_curve[0]) / (t_pred[-1] - t_pred[0])
+                    
+                    models_to_try.append({
+                        "model": model_poly,
+                        "poly_features": poly_features,
+                        "r2": r2_poly,
+                        "name": f"Polynomial({degree})",
+                        "type": "polynomial",
+                        "predict_func": lambda t, m=model_poly, pf=poly_features: m.predict(pf.transform(t.reshape(-1, 1))),
+                        "slope": float(slope),
+                        "intercept": float(y_pred_curve[0]),
+                    })
+                except Exception as e:
+                    log.debug(f"多项式回归(degree={degree})失败: {e}")
+        
+        # 3.3 指数回归（y = a * exp(b * t) + c）
+        if SCIPY_AVAILABLE and len(y) >= 5:
+            try:
+                y_min = float(y.min())
+                y_offset = y - y_min + 1e-6
+                y_log = np.log(y_offset)
+                
+                # 使用scipy的curve_fit
+                def exp_func(t, a, b):
+                    return a * np.exp(b * t) + y_min - 1e-6
+                
+                popt, _ = curve_fit(exp_func, t_days.values, y, p0=[y_offset[0], 0.01], maxfev=1000)
+                y_pred = exp_func(t_days.values, *popt)
+                r2_exp = r2_score(y, y_pred)
+                
+                # 计算平均斜率
+                t_pred = np.linspace(t_days.min(), t_days.max(), 100)
+                y_pred_curve = exp_func(t_pred, *popt)
+                slope = (y_pred_curve[-1] - y_pred_curve[0]) / (t_pred[-1] - t_pred[0])
+                
+                models_to_try.append({
+                    "model": popt,
+                    "y_min": y_min,
+                    "r2": r2_exp,
+                    "name": "Exponential",
+                    "type": "exponential",
+                    "predict_func": lambda t, p=popt, ym=y_min: p[0] * np.exp(p[1] * t) + ym - 1e-6,
+                    "slope": float(slope),
+                    "intercept": float(y_pred_curve[0]),
+                })
+            except Exception as e:
+                log.debug(f"指数回归失败: {e}")
+        
+        # 3.4 分段线性回归（如果数据有明显转折点）
+        if len(y) >= 10:
+            try:
+                # 使用简单的分段线性：找到最佳分割点
+                best_split_r2 = -np.inf
+                best_split_idx = len(y) // 2
+                
+                for split_idx in range(len(y) // 3, len(y) * 2 // 3):
+                    t1 = t_days.values[:split_idx]
+                    t2 = t_days.values[split_idx:]
+                    y1 = y[:split_idx]
+                    y2 = y[split_idx:]
+                    
+                    if len(t1) >= 3 and len(t2) >= 3:
+                        slope1, intercept1, _, _, _ = linregress(t1, y1)
+                        slope2, intercept2, _, _, _ = linregress(t2, y2)
+                        
+                        y_pred1 = slope1 * t1 + intercept1
+                        y_pred2 = slope2 * t2 + intercept2
+                        y_pred_all = np.concatenate([y_pred1, y_pred2])
+                        
+                        r2_split = r2_score(y, y_pred_all)
+                        if r2_split > best_split_r2:
+                            best_split_r2 = r2_split
+                            best_split_idx = split_idx
+                
+                if best_split_r2 > 0.3:  # 只有当R²足够好时才使用分段模型
+                    t1 = t_days.values[:best_split_idx]
+                    t2 = t_days.values[best_split_idx:]
+                    y1 = y[:best_split_idx]
+                    y2 = y[best_split_idx:]
+                    
+                    slope1, intercept1, _, _, _ = linregress(t1, y1)
+                    slope2, intercept2, _, _, _ = linregress(t2, y2)
+                    
+                    # 使用第二段的斜率（更接近当前趋势）
+                    slope = slope2
+                    
+                    models_to_try.append({
+                        "model": {"slope1": slope1, "intercept1": intercept1, "slope2": slope2, "intercept2": intercept2, "split_idx": best_split_idx},
+                        "r2": best_split_r2,
+                        "name": "PiecewiseLinear",
+                        "type": "piecewise",
+                        "predict_func": None,  # 分段函数需要特殊处理
+                        "slope": float(slope),
+                        "intercept": float(intercept2),
+                    })
+            except Exception as e:
+                log.debug(f"分段线性回归失败: {e}")
+        
+        # 4. 选择最佳模型（R²最高，且R² > 0.1）
+        if models_to_try:
+            # 过滤掉R²太低的模型
+            valid_models = [m for m in models_to_try if m["r2"] > 0.1]
+            if valid_models:
+                best_model = max(valid_models, key=lambda x: x["r2"])
+                best_r2 = best_model["r2"]
+                best_trend_analysis = TrendAnalysis(
+                    slope=best_model["slope"],
+                    intercept=best_model["intercept"],
+                    r2=best_r2,
+                    trend_type=best_model["type"],
+                    model_name=best_model["name"],
+                )
+            else:
+                # 如果没有R² > 0.1的模型，使用R²最高的
+                best_model = max(models_to_try, key=lambda x: x["r2"])
+                best_r2 = best_model["r2"]
+                best_trend_analysis = TrendAnalysis(
+                    slope=best_model["slope"],
+                    intercept=best_model["intercept"],
+                    r2=best_r2,
+                    trend_type=best_model["type"],
+                    model_name=best_model["name"],
+                )
+        else:
+            # 回退到简单线性回归
+            slope, intercept, r_value, p_value, std_err = linregress(t_days.values, y)
+            best_trend_analysis = TrendAnalysis(
+                slope=float(slope),
+                intercept=float(intercept),
+                r2=float(r_value ** 2),
+                p_value=float(p_value) if p_value else None,
+            )
+            best_model = {"slope": slope, "intercept": intercept, "predict_func": lambda t: slope * t + intercept}
+            best_r2 = float(r_value ** 2)
+        
+        # 5. 预测RUL
+        if best_model is None or abs(best_trend_analysis.slope) < 1e-6:
+            return None, best_trend_analysis, None
+        
+        current_value = float(y[-1])
+        t_current = float(t_days.iloc[-1])
+        
+        # 判断趋势方向
+        is_rising = best_trend_analysis.slope > 0
+        
+        # 预测达到阈值的时间
+        try:
+            if best_model["type"] == "piecewise":
+                # 分段线性：使用第二段预测
+                slope2 = best_model["model"]["slope2"]
+                intercept2 = best_model["model"]["intercept2"]
+                if abs(slope2) < 1e-6:
+                    return None, best_trend_analysis, None
+                
+                if is_rising:
+                    if current_value >= crit_threshold:
+                        return 0.0, best_trend_analysis, None
+                    rul_days = float((crit_threshold - intercept2) / slope2 - t_current)
+                else:
+                    if current_value <= crit_threshold:
+                        return 0.0, best_trend_analysis, None
+                    rul_days = float((crit_threshold - intercept2) / slope2 - t_current)
+            elif best_model["type"] == "exponential":
+                # 指数模型：二分搜索
+                rul_days = self._predict_rul_exponential(
+                    best_model["predict_func"], t_current, current_value, crit_threshold, is_rising
+                )
+            elif best_model["type"] == "polynomial":
+                # 多项式模型：二分搜索
+                rul_days = self._predict_rul_polynomial(
+                    best_model["predict_func"], t_current, current_value, crit_threshold, is_rising
+                )
+            else:
+                # 线性模型
+                slope = best_trend_analysis.slope
+                if is_rising:
+                    if current_value >= crit_threshold:
+                        return 0.0, best_trend_analysis, None
+                    rul_days = float((crit_threshold - current_value) / slope)
+                else:
+                    if current_value <= crit_threshold:
+                        return 0.0, best_trend_analysis, None
+                    rul_days = float((current_value - crit_threshold) / abs(slope))
+            
+            if rul_days is None or rul_days < 0:
+                return None, best_trend_analysis, None
+            
+            rul_days = max(0.0, min(365.0, rul_days))
+            
+            # 根据R²调整置信度提示
+            if best_r2 < 0.3:
+                log.warning(f"指标 {metric_id} R²={best_r2:.3f}较低（模型={best_model['name']}），RUL预测可能不准确")
+            elif best_r2 < 0.6:
+                log.info(f"指标 {metric_id} R²={best_r2:.3f}中等（模型={best_model['name']}），RUL预测可信度一般")
+            else:
+                log.info(f"指标 {metric_id} R²={best_r2:.3f}良好（模型={best_model['name']}），RUL预测可信")
+            
+            return round(rul_days, 1), best_trend_analysis, None
+            
+        except Exception as e:
+            log.warning(f"RUL预测失败: {e}")
+            import traceback
+            log.debug(traceback.format_exc())
+            return None, best_trend_analysis, None
+    
+    def _decompose_time_series(self, t: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        时间序列分解：提取趋势和周期成分
+            
+        Returns:
+            (trend_component, seasonal_component)
+        """
+        # 简单方法：使用移动平均提取趋势，残差作为周期
+        window_size = max(3, min(len(y) // 7, 7))
+        if window_size > 1 and len(y) >= window_size * 2:
+            trend = pd.Series(y).rolling(window=window_size, center=True).mean()
+            trend = trend.bfill().ffill()
+            trend = trend.values
+            seasonal = y - trend
+        else:
+            trend = y.copy()
+            seasonal = np.zeros_like(y)
+        
+        return trend, seasonal
+    
+    def _predict_rul_exponential(
+        self,
+        predict_func,
+        t_current: float,
+        current_value: float,
+        crit_threshold: float,
+        is_rising: bool,
+    ) -> Optional[float]:
+        """使用指数模型预测RUL（二分搜索）"""
+        try:
+            t_min = float(t_current)
+            t_max = float(t_current + 365)
+            
+            for _ in range(50):
+                t_mid = (t_min + t_max) / 2.0
+                y_pred = float(predict_func(np.array([t_mid]))[0])
+                
+                if is_rising:
+                    if y_pred >= crit_threshold:
+                        t_max = t_mid
+                    else:
+                        t_min = t_mid
+                else:
+                    if y_pred <= crit_threshold:
+                        t_max = t_mid
+                    else:
+                        t_min = t_mid
+                
+                if abs(t_max - t_min) < 0.01:
+                    break
+            
+            rul_days = (t_min + t_max) / 2.0 - t_current
+            return float(max(0.0, rul_days))
+        except:
+            return None
+    
+    def _predict_rul_polynomial(
+        self,
+        predict_func,
+        t_current: float,
+        current_value: float,
+        crit_threshold: float,
+        is_rising: bool,
+    ) -> Optional[float]:
+        """使用多项式模型预测RUL（二分搜索）"""
+        try:
+            t_min = float(t_current)
+            t_max = float(t_current + 365)
+            
+            for _ in range(50):
+                t_mid = (t_min + t_max) / 2.0
+                y_pred = float(predict_func(np.array([t_mid]))[0])
+                
+                if is_rising:
+                    if y_pred >= crit_threshold:
+                        t_max = t_mid
+                    else:
+                        t_min = t_mid
+                else:
+                    if y_pred <= crit_threshold:
+                        t_max = t_mid
+                    else:
+                        t_min = t_mid
+                
+                if abs(t_max - t_min) < 0.01:
+                    break
+            
+            rul_days = (t_min + t_max) / 2.0 - t_current
+            return float(max(0.0, rul_days))
+        except:
+            return None
+    
+    def get_time_series_data(
         self, 
-        context: Any, 
-        device_id: Optional[int], 
-        device_health_score: float,
-        metrics_results: List[Dict[str, Any]]
-    ) -> float:
+        data: Dict[str, pd.DataFrame],
+        asset_id: str,
+        metric_id: str,
+        max_points: int = 500,
+    ) -> List[TimeSeriesPoint]:
         """
-        计算停机风险
-        特征：
-        - x1: 设备健康度（越低风险越高）
-        - x2: 最小 RUL（越小风险越高）
-        - x3: 维护费用比率（最近30天/历史均值）
+        获取时间序列数据（用于曲线图）
+        
+        Args:
+            data: 数据字典
+            asset_id: 设备ID
+            metric_id: 测点ID
+            max_points: 最大数据点数（用于降采样）
+        
+        Returns:
+            时间序列数据点列表
         """
-        if device_id is None:
-            return 0.0
+        from backend.algorithm.data_service import prepare_process_series
         
-        # 特征1: 健康度风险（健康度越低，风险越高）
-        health_risk = (100 - device_health_score) / 100.0
+        df = prepare_process_series(
+            data,
+            metric_id,
+            asset_id=asset_id,
+            window_days=self.window_days,
+            machine_state=self.machine_state_filter,
+            quality_threshold=self.quality_threshold,
+        )
         
-        # 特征2: RUL风险（找到最小的 RUL）
-        min_rul = None
-        for m in metrics_results:
-            if m.get("rul_days") is not None:
-                rul = m["rul_days"]
-                if min_rul is None or (rul is not None and rul < min_rul):
-                    min_rul = rul
+        if df.empty:
+            return []
         
-        if min_rul is None:
-            rul_risk = 0.0
-        elif min_rul <= 0:
-            rul_risk = 1.0
-        elif min_rul < 30:
-            rul_risk = 1.0 / (min_rul + 1)  # RUL越小，风险越大
-        else:
-            rul_risk = 0.1  # RUL较大时风险较低
+        df = df.sort_values("timestamp")
         
-        # 特征3: 维护费用比率
-        maintenance_df = context.get("maintenance_costs", pd.DataFrame())
-        if maintenance_df.empty:
-            maintenance_risk = 0.0
-        else:
-            device_maintenance = maintenance_df[maintenance_df["device_id"] == device_id]
-            if device_maintenance.empty:
-                maintenance_risk = 0.0
-            else:
-                # 计算最近30天和历史均值的比率
-                # 确保时区一致性：如果 period_end 带时区，recent_cutoff 也要带时区
-                period_end_series = device_maintenance["period_end"]
-                if hasattr(period_end_series.dtype, 'tz') and period_end_series.dtype.tz is not None:
-                    # period_end 带时区，使用相同的时区
-                    tz = period_end_series.dtype.tz
-                    recent_cutoff = pd.Timestamp.now(tz=tz) - pd.Timedelta(days=30)
+        # 降采样（如果数据点太多，按步长抽样）
+        if len(df) > max_points:
+            step = max(1, len(df) // max_points)
+            df = df.iloc[::step]
+        
+        # 计算平滑值（与 RUL 预测中保持一致的平滑逻辑）
+        y_raw = df["value"].values
+        if len(y_raw) >= 7 and SCIPY_AVAILABLE:
+            try:
+                window_length = min(7, len(y_raw) // 2 * 2 - 1)  # 必须是奇数
+                if window_length >= 3:
+                    y_smooth = signal.savgol_filter(y_raw, window_length, 2)
                 else:
-                    # period_end 不带时区，使用本地时间（不带时区）
-                    recent_cutoff = pd.Timestamp.now() - pd.Timedelta(days=30)
-                recent = device_maintenance[device_maintenance["period_end"] >= recent_cutoff]["cost"].sum()
-                historical_avg = device_maintenance["cost"].mean()
-                if historical_avg > 0:
-                    maintenance_risk = min(1.0, recent / (historical_avg * 30))  # 归一化
+                    y_smooth = y_raw
+            except Exception:
+                y_smooth = y_raw
+        else:
+            # 简单移动平均
+            window_size = max(3, min(len(y_raw) // 10, 5))
+            if window_size > 1:
+                y_smooth = pd.Series(y_raw).rolling(window=window_size, center=True).mean()
+                y_smooth = y_smooth.bfill().ffill()
+                y_smooth = y_smooth.values
+            else:
+                y_smooth = y_raw
+        
+        # 构建时间序列点
+        points = []
+        for i, (idx, row) in enumerate(df.iterrows()):
+            timestamp_str = row["timestamp"].isoformat() if hasattr(row["timestamp"], "isoformat") else str(row["timestamp"])
+            smoothed_val = round(float(y_smooth[i]), 2) if i < len(y_smooth) else None
+            points.append(TimeSeriesPoint(
+                timestamp=timestamp_str,
+                value=round(float(row["value"]), 2),
+                smoothed_value=smoothed_val,
+            ))
+        
+        return points
+    
+    def diagnose_fault(
+        self,
+        waveform_data: np.ndarray,
+        sampling_rate: int,
+        ref_rpm: Optional[float] = None,
+    ) -> Dict[str, float]:
+        """
+        故障诊断（基于波形FFT分析）
+        
+        算法流程：
+        1. 对波形进行FFT变换
+        2. 提取频域特征（1X, 2X倍频，轴承故障频率等）
+        3. 输入分类器得到故障概率
+        
+        Args:
+            waveform_data: 波形数据数组
+            sampling_rate: 采样率（Hz）
+            ref_rpm: 参考转速（RPM）
+        
+        Returns:
+            故障概率字典
+        """
+        if not SCIPY_AVAILABLE or waveform_data is None or len(waveform_data) == 0:
+            return {"normal": 0.5}
+        
+        try:
+            # FFT变换
+            fft_result = fft(waveform_data)
+            freqs = fftfreq(len(waveform_data), 1.0 / sampling_rate)
+            
+            # 提取特征（简化处理）
+            # 实际应用中需要训练分类器
+            return {
+                "bearing_wear": 0.3,
+                "normal": 0.7,
+            }
+        except Exception as e:
+            log.warning(f"故障诊断失败: {e}")
+            return {"unknown": 0.5}
+    
+    def analyze_asset(
+        self,
+        data: Dict[str, pd.DataFrame],
+        asset_id: str,
+        use_lstm: bool = True,
+        require_lstm: bool = False,
+    ) -> HealthAnalysisResult:
+        """
+        综合分析设备（增强版）
+        
+        返回包含多维度评分、时间序列数据、统计信息的完整结果
+        
+        Args:
+            data: 数据字典
+            asset_id: 设备ID
+        
+        Returns:
+            健康分析结果（包含多维度评分和时间序列数据）
+        """
+        # 1. 计算健康分（多维度）
+        health_score, dimension_scores = self.analyze_health_score(data, asset_id)
+        
+        # 2. 计算RUL（使用主要测点）
+        metric_defs = data.get("metric_definitions", pd.DataFrame())
+        rul_days = None
+        trend_slopes = []
+        trend_analyses = []
+        
+        if not metric_defs.empty:
+            asset_metrics = metric_defs[
+                (metric_defs["asset_id"] == asset_id) &
+                (metric_defs["metric_type"] == "PROCESS")
+            ]
+            
+            if not asset_metrics.empty:
+                # 分析所有测点（不再限制为5个）
+                # 这样可以对所有指标进行RUL预测，提供更全面的分析
+                for _, metric in asset_metrics.iterrows():
+                    metric_id = metric["metric_id"]
+                    rul, trend_analysis, error_msg = self.analyze_rul(
+                        data, asset_id, metric_id, 
+                        use_lstm=use_lstm, 
+                        require_lstm=require_lstm
+                    )
+                    
+                    # 如果require_lstm=True且没有LSTM模型，抛出异常
+                    if require_lstm and error_msg:
+                        raise ValueError(error_msg)
+                    
+                    if rul is not None:
+                        # 取所有测点中最短的剩余寿命，作为设备的整体 RUL
+                        if rul_days is None:
+                            rul_days = rul
+                        else:
+                            rul_days = min(rul_days, rul)
+                    
+                    if trend_analysis and abs(trend_analysis.slope) > 1e-6:
+                        trend_slopes.append(trend_analysis.slope)
+                        trend_analyses.append(trend_analysis)
+        
+        trend_slope = float(np.mean(trend_slopes)) if trend_slopes else 0.0
+        
+        # 3. 故障诊断
+        waveform_df = data.get("telemetry_waveform", pd.DataFrame())
+        diagnosis_result = {"normal": 0.5}
+        
+        if not waveform_df.empty and "asset_id" in waveform_df.columns:
+            waveform_df = waveform_df[waveform_df["asset_id"] == asset_id]
+            if not waveform_df.empty:
+                # 简化处理：实际需要加载二进制数据
+                diagnosis_result = {
+                    "bearing_wear": 0.3,
+                    "normal": 0.7,
+                }
+        
+        # 4. 计算置信度：综合数据量与趋势拟合优度（R²）
+        process_df = data.get("telemetry_process", pd.DataFrame())
+        if process_df.empty or metric_defs.empty:
+            prediction_confidence = 0.0
+        else:
+            asset_metrics = metric_defs[metric_defs["asset_id"] == asset_id]
+            if asset_metrics.empty or "metric_id" not in process_df.columns:
+                prediction_confidence = 0.0
+            else:
+                asset_process = process_df[
+                    (process_df["metric_id"].isin(asset_metrics["metric_id"])) &
+                    (process_df["quality"] >= self.quality_threshold)
+                ]
+                data_points = len(asset_process)
+                # 基础置信度：数据点越多，置信度越高（200 个数据点视为 1.0）
+                base_confidence = min(1.0, data_points / 200.0)
+                
+                # 如果有趋势分析，根据平均 R² 调整置信度
+                if trend_analyses:
+                    avg_r2 = np.mean([ta.r2 for ta in trend_analyses])
+                    r2_factor = min(1.0, avg_r2 * 1.2)  # R² 越高，置信度越高
+                    prediction_confidence = base_confidence * 0.7 + r2_factor * 0.3
                 else:
-                    maintenance_risk = 0.0
+                    prediction_confidence = base_confidence
         
-        # 简化规则：加权平均（可调整权重）
-        downtime_risk = 0.4 * health_risk + 0.4 * rul_risk + 0.2 * maintenance_risk
-        return round(min(1.0, max(0.0, downtime_risk)), 3)
-
-    def compute_throughput_impact(
-        self,
-        context: Any,
-        device_id: Optional[int],
-        device_health_score: float,
-        downtime_risk: float
-    ) -> float:
-        """
-        计算产能影响（基于规则）
-        产能损失率 = 1 - OEE
-        """
-        if device_id is None:
-            return 0.0
-        
-        oee_df = context.get("oee_stats", pd.DataFrame())
-        if oee_df.empty:
-            # 如果没有 OEE 数据，基于健康度和停机风险估算
-            health_impact = (100 - device_health_score) / 100.0
-            throughput_impact = 0.6 * health_impact + 0.4 * downtime_risk
-            return round(min(1.0, max(0.0, throughput_impact)), 3)
-        
-        # 获取设备最近的 OEE 数据
-        device_oee = oee_df[oee_df["device_id"] == device_id]
-        if device_oee.empty:
-            # 使用健康度和停机风险估算
-            health_impact = (100 - device_health_score) / 100.0
-            throughput_impact = 0.6 * health_impact + 0.4 * downtime_risk
-            return round(min(1.0, max(0.0, throughput_impact)), 3)
-        
-        # 计算最近的 OEE（取最新记录）
-        latest_oee = device_oee.sort_values("period_end").iloc[-1]
-        availability = latest_oee.get("availability", 1.0)
-        performance = latest_oee.get("performance", 1.0)
-        quality_rate = latest_oee.get("quality_rate", 1.0)
-        
-        oee = availability * performance * quality_rate
-        throughput_impact = 1.0 - oee
-        
-        # 结合健康度和停机风险进行修正
-        health_factor = (100 - device_health_score) / 100.0
-        throughput_impact = 0.5 * throughput_impact + 0.3 * health_factor + 0.2 * downtime_risk
-        
-        return round(min(1.0, max(0.0, throughput_impact)), 3)
-
-    def compute_spare_life(
-        self,
-        context: Any,
-        device_id: Optional[int]
-    ) -> Dict[str, Any]:
-        """
-        计算备件寿命信息
-        完整版本需要 Weibull 模型。
-        这里先实现基于 usage_cycles 的简化版本。
-        
-        参数说明：
-        - usage_cycles: 使用循环次数（单位：周期）
-          * 一个周期 = 设备运行1小时（或根据实际业务定义，如：完成一个加工周期）
-          * 具体定义需要根据业务场景确定，建议在业务文档中明确说明
-        
-        数据说明：
-        - 当前数据中没有 max_cycles 字段，这里根据备件类型（part_code）使用映射表。
-        - 如果未来数据中有 max_cycles 字段，优先使用数据中的值。
-        """
-        if device_id is None:
-            return {"status": "no_device", "spare_parts": []}
-        
-        spare_df = context.get("spare_usage_cycles", pd.DataFrame())
-        if spare_df.empty:
-            return {"status": "no_data", "spare_parts": []}
-        
-        device_spares = spare_df[spare_df["device_id"] == device_id]
-        if device_spares.empty:
-            return {"status": "no_spares", "spare_parts": []}
-        
-        # 备件类型到最大使用周期的映射表
-        # 
-        # 单位说明：
-        # - usage_cycles 和 max_cycles 的单位都是"使用周期"
-        # - 一个周期通常定义为：设备运行1小时（或根据业务定义，如完成一个加工周期）
-        # - 具体周期定义需要根据实际业务场景确定
-        #
-        # 映射表说明：
-        # - 根据常见备件的设计寿命设定（单位：使用周期）
-        # - 如果数据中有 max_cycles 字段，优先使用数据中的值
-        part_max_cycles_map = {
-            "BRG-6205": 5000,      # 轴承类型，设计寿命约 5000 周期（假设1周期=1小时，即5000小时）
-            "BRG-6308": 5000,      # 轴承类型，设计寿命约 5000 周期
-            "AIR-FILTER-01": 3000, # 空气过滤器，设计寿命约 3000 周期
-            "AIR-FILTER-02": 3000, # 空气过滤器，设计寿命约 3000 周期
-            "OIL-SEPARATOR-01": 4000,  # 油分离器，设计寿命约 4000 周期
-            "SPINDLE-BELT-01": 8000,    # 主轴皮带，设计寿命约 8000 周期
-            "COOLANT-PUMP-01": 6000,    # 冷却泵，设计寿命约 6000 周期
-            "TOOL-HOLDER-01": 10000,     # 刀柄，设计寿命约 10000 周期
-            "PRESSURE-VALVE-01": 5000,  # 压力阀，设计寿命约 5000 周期
-        }
-        default_max_cycles = 5000  # 未知备件类型的默认值（5000 周期）
-        
-        spare_parts_info = []
-        for _, row in device_spares.iterrows():
-            # 获取使用周期
-            usage_cycles = row.get("usage_cycles", 0)
+        # 5. 获取时间序列数据（用于曲线图）
+        time_series_data = {}
+        if not metric_defs.empty:
+            asset_metrics = metric_defs[
+                (metric_defs["asset_id"] == asset_id) &
+                (metric_defs["metric_type"] == "PROCESS")
+            ]
             
-            # 获取最大使用周期：优先使用数据中的值，否则从映射表查找，最后用默认值
-            if "max_cycles" in row and pd.notna(row.get("max_cycles")):
-                max_cycles = float(row["max_cycles"])
-            else:
-                part_code = row.get("part_code", "")
-                max_cycles = part_max_cycles_map.get(part_code, default_max_cycles)
+            # 为每个维度选择一个代表性测点
+            dimension_metrics = {}
+            for _, metric in asset_metrics.iterrows():
+                metric_id = metric["metric_id"]
+                metric_name = metric.get("metric_name", metric_id)
+                dimension_name = self._extract_dimension_name(metric_name, metric_id)
+                
+                if dimension_name not in dimension_metrics:
+                    dimension_metrics[dimension_name] = metric_id
             
-            # 计算使用率
-            if max_cycles > 0:
-                usage_ratio = usage_cycles / max_cycles
-            else:
-                usage_ratio = 0.0
-            remaining_ratio = 1.0 - usage_ratio
-            
-            if usage_ratio > 0.9:
-                status = "critical"
-            elif usage_ratio > 0.7:
-                status = "warning"
-            else:
-                status = "normal"
-            
-            # 构建备件信息（如果数据中没有 spare_part_name，使用 part_code 作为名称）
-            spare_parts_info.append({
-                "spare_part_id": row.get("spare_part_id", row.get("part_code")),
-                "spare_part_name": row.get("spare_part_name", row.get("part_code")),
-                "part_code": row.get("part_code", ""),
-                "usage_cycles": usage_cycles,
-                "max_cycles": max_cycles,
-                "usage_ratio": round(usage_ratio, 3),
-                "remaining_ratio": round(remaining_ratio, 3),
-                "status": status
-            })
+            for dimension_name, metric_id in dimension_metrics.items():
+                points = self.get_time_series_data(data, asset_id, metric_id, max_points=200)
+                if points:
+                    time_series_data[dimension_name] = points
         
-        # 统计关键备件数量
-        critical_count = 0
-        for s in spare_parts_info:
-            if s["status"] == "critical":
-                critical_count = critical_count + 1
-        
-        return {
-            "status": "ok",
-            "spare_parts": spare_parts_info,
-            "total_parts": len(spare_parts_info),
-            "critical_count": critical_count,
-        }
+        # 6. 计算统计信息（用于统计图）
+        statistics = {}
+        if not process_df.empty:
+            asset_metrics = metric_defs[metric_defs["asset_id"] == asset_id]
+            if not asset_metrics.empty:
+                asset_process = process_df[
+                    (process_df["metric_id"].isin(asset_metrics["metric_id"])) &
+                    (process_df["quality"] >= self.quality_threshold)
+                ]
+                
+                if not asset_process.empty:
+                    statistics = {
+                        "total_data_points": len(asset_process),
+                        "date_range": {
+                            "start": asset_process["timestamp"].min().isoformat() if hasattr(asset_process["timestamp"].min(), "isoformat") else str(asset_process["timestamp"].min()),
+                            "end": asset_process["timestamp"].max().isoformat() if hasattr(asset_process["timestamp"].max(), "isoformat") else str(asset_process["timestamp"].max()),
+                        },
+                        "data_quality_rate": len(asset_process[asset_process["quality"] == 1]) / len(asset_process) if len(asset_process) > 0 else 0.0,
+                        "machine_state_distribution": asset_process["machine_state"].value_counts().to_dict() if "machine_state" in asset_process.columns else {},
+                    }
 
-
-
-if __name__ == "__main__":
-    from backend.algorithm.demo_runner import run_demo
-
-    run_demo()
+        return HealthAnalysisResult(
+            health_score=health_score,
+            rul_days=rul_days,
+            trend_slope=trend_slope,
+            diagnosis_result=diagnosis_result,
+            prediction_confidence=round(prediction_confidence, 3),
+            model_version="2.0",
+            dimension_scores=dimension_scores,
+            time_series_data=time_series_data,
+            statistics=statistics,
+        )

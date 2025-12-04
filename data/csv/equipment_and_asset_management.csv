@@ -1,5 +1,0 @@
-device_id,serial_number,asset_code,location,status,vendor,brand,model_revision,installed_at,commissioned_at,warranty_end,maintenance_contract_id,management_team,maintainer_id
-1,VM500-20231108-A01,ASM-001,Line1-Station3,active,Makino,Makino,RevB,2023-11-08T00:00:00+08:00,2023-11-15T00:00:00+08:00,2026-11-08T00:00:00+08:00,MC-2024-001,ME-Team-A,501
-2,AC75-20231001-01,ASM-101,Utility-Room-2,active,AtlasCopco,AC,RevA,2023-10-01T00:00:00+08:00,2023-10-05T00:00:00+08:00,2026-10-01T00:00:00+08:00,MC-2024-005,ME-Team-B,502
-3,VM500-20240115-A02,ASM-002,Line2-Station1,active,Makino,Makino,RevC,2024-01-15T00:00:00+08:00,2024-01-20T00:00:00+08:00,2027-01-15T00:00:00+08:00,MC-2024-009,ME-Team-A,503
-4,AC75-20240220-02,ASM-102,Utility-Room-1,active,AtlasCopco,AC,RevA,2024-02-20T00:00:00+08:00,2024-02-25T00:00:00+08:00,2027-02-20T00:00:00+08:00,MC-2024-012,ME-Team-B,504

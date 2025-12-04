@@ -1,20 +1,31 @@
-# coding:utf-8
+"""
+EMSforAI 数据服务层
 
+本模块负责从数据库加载数据并转换为算法引擎所需的格式。
+适配4域8表架构，提供数据查询、过滤、预处理等功能。
+
+主要功能：
+- 从数据库加载所有的数据
+- 准备过程数据时间序列
+- 加载波形二进制数据
+- 提取维护标签（用于AI训练）
+- 提取知识库上下文（用于LLM RAG）
+
+Author: EMSforAI Team
+License: MIT
+"""
 from __future__ import annotations
 
 import json
 import logging
 import sys
-from contextlib import contextmanager
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import select, create_engine
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 if str(BASE_DIR) not in sys.path:
@@ -25,560 +36,374 @@ from backend import models
 
 log = logging.getLogger(__name__)
 
-CRIT_WEIGHT = {"high": 1.2, "medium": 1.0, "low": 0.8}
 
-CSV_PATH = BASE_DIR / "data" / "csv"
-
-# 做 JSON 解析列定义
-JSON_FIELDS: Dict[str, List[str]] = {
-    "device_metric_definitions": ["feature_snapshot"],
-    "inspection_submits": ["metrics"],
-    "metric_ai_analysis": ["curve_points", "extra_info", "feature_snapshot"],
-    "inspection_metric_values": ["metrics_data"],
-}
-
-# 时间列定义，便于读取时自动转为 datetime
-DATE_FIELDS: Dict[str, List[str]] = {
-    "inspection_submits": ["recorded_at"],
-    "metric_ai_analysis": ["calc_time"],
-    "maintenance_costs": ["period_start", "period_end"],
-    "oee_stats": ["period_start", "period_end"],
-}
-
-# 默认需要加载的表名列表
-DEFAULT_TABLES: List[str] = [
-    "device_metric_definitions",
-    "device_models",
-    "devices",
-    "energy_consumption",
-    "equipment_and_asset_management",
-    "inspection_submits",
-    "inspection_logs",
-    "inspection_metric_values",
-    "maintenance_costs",
-    "metric_ai_analysis",
-    "oee_stats",
-    "spare_usage_cycles",
-]
-
-
-def validate_db_config(db_engine: Optional[Engine] = None) -> None:
-    """数据库配置校验，确保连接字符串合法"""
-    engine_to_check = db_engine or default_engine
-    url = str(engine_to_check.url)
-    if "://" not in url:
-        raise ValueError("数据库连接字符串格式不正确，请检查 DB_URL / DATABASE_URL 配置")
-    # 可在此处扩展更多连接池、超时等校验
-
-
-def _safe_json_load(value: Any) -> Any:
-    """安全 JSON 解析：仅对字符串尝试 json.loads，异常时返回原值"""
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        log.warning("JSON 解析失败，保持原值: %s", value)
-        return value
-
-
-def _apply_json_fields(df: pd.DataFrame, fields: Iterable[str]) -> pd.DataFrame:
-    """对指定列执行 JSON 解析，返回新的 DataFrame"""
-    for col in fields:
-        if col in df.columns:
-            df[col] = df[col].apply(_safe_json_load)
-    return df
-
-
-def _discover_csv_tables(base: Path) -> List[str]:
-    """自动扫描 CSV 目录，返回所有文件名。"""
-    base_path = Path(base)
-    if not base_path.exists():
-        raise FileNotFoundError(f"CSV 目录不存在: {base_path}")
-    tables = sorted(p.stem for p in base_path.glob("*.csv"))
-    if not tables:
-        log.warning("CSV 目录中未发现任何文件: %s", base_path)
-    return tables
-
-
-def _resolve_csv_tables(tables: Optional[Iterable[str]], base: Path) -> List[str]:
-    """
-    决定 CSV 读取列表：
-        tables 未指定时读取目录下全部 CSV
-        tables 指定时保持顺序并去重
-    """
-    if tables:
-        seen = set()
-        ordered: List[str] = []
-        for name in tables:
-            if name not in seen:
-                ordered.append(name)
-                seen.add(name)
-        return ordered
-    discovered = _discover_csv_tables(base)
-    return discovered or DEFAULT_TABLES
-
-
-def _get_data_from_csv(
-    tables: Optional[Iterable[str]] = None,
-    base: Path = CSV_PATH,
-    verbose: bool = False,
-) -> Dict[str, pd.DataFrame]:
-    """从 CSV 目录批量读取数据"""
-    tables_to_read = _resolve_csv_tables(tables, base)
-    data: Dict[str, pd.DataFrame] = {}
-    for table in tables_to_read:
-        path = Path(base) / f"{table}.csv"
-        if not path.exists():
-            log.error("CSV 文件不存在: %s", path)
-            raise FileNotFoundError(f"CSV 文件不存在: {path}")
-        parse_dates = DATE_FIELDS.get(table, [])
-        try:
-            df = pd.read_csv(path, parse_dates=parse_dates)
-        except Exception as exc:
-            log.exception("读取 CSV 失败: %s", path)
-            raise ValueError(f"读取 CSV 失败: {path}") from exc
-        json_cols = JSON_FIELDS.get(table, [])
-        df = _apply_json_fields(df, json_cols)
-        data[table] = df
-        if verbose:
-            print(f"[CSV] 表: {table} | 行数: {len(df)} | 列: {list(df.columns)}")
-            print(df.head(3))
-    return data
-
-
-@lru_cache(maxsize=32)
-def _cached_db_query(
-    engine_url: str,
-    table_name: str,
-    limit: Optional[int],
-    offset: Optional[int],
-) -> List[Dict[str, Any]]:
-    """简单 LRU 缓存，降低重复查询压力"""
-    engine_to_use = default_engine if str(default_engine.url) == engine_url else create_engine(engine_url)
-    with engine_to_use.connect() as conn:
-        query = f"SELECT * FROM {table_name}"
-        if offset is not None:
-            query += f" LIMIT {limit or 0} OFFSET {offset}"
-        elif limit is not None:
-            query += f" LIMIT {limit}"
-        return pd.read_sql(query, conn).to_dict(orient="records")
-
-
-def _get_data_from_db(
-    tables: Optional[Iterable[str]] = None,
+def load_data_from_db(
     session: Optional[Session] = None,
-    db_engine: Optional[Engine] = None,
-    limit: Optional[int] = None,
-    offset: Optional[int] = None,
+    asset_id: Optional[str] = None,
+    start_time: Optional[pd.Timestamp] = None,
+    end_time: Optional[pd.Timestamp] = None,
 ) -> Dict[str, pd.DataFrame]:
-    """从数据库读取数据，保持与 CSV 相同的数据结构"""
-    validate_db_config(db_engine)
-    engine_to_use = db_engine or default_engine
-    tables_to_use = list(tables) if tables else DEFAULT_TABLES
-
-    orm_map: Dict[str, Any] = {
-        "device_metric_definitions": models.DeviceMetricDefinition,
-        "device_models": models.DeviceModel,
-        "devices": models.Device,
-        "energy_consumption": models.EnergyConsumption,
-        "equipment_and_asset_management": models.EquipmentAndAssetManagement,
-        "inspection_submits": models.InspectionLog,  # CSV 兼容字段
-        "inspection_logs": models.InspectionLog,
-        "inspection_metric_values": models.InspectionMetricValue,
-        "maintenance_costs": models.MaintenanceCost,
-        "metric_ai_analysis": models.MetricAIAnalysis,
-        "oee_stats": models.OEEStat,
-        "spare_usage_cycles": models.SpareUsage,
-    }
+    """
+    从数据库加载所有域的数据
+    
+    Args:
+        session: 数据库会话
+        asset_id: 设备ID（可选，过滤特定设备）
+        start_time: 开始时间（可选，过滤时间范围）
+        end_time: 结束时间（可选，过滤时间范围）
+    
+    Returns:
+        数据字典，包含所有表的数据
+    """
     if session is None:
-        # 根据传入的 db_engine 创建会话，确保连接池和事务配置一致
-        if db_engine is None:
-            local_session = SessionLocal()
-        else:
-            SessionMaker = sessionmaker(bind=db_engine)
-            local_session = SessionMaker()
+        local_session = SessionLocal()
         created_session = True
     else:
         local_session = session
         created_session = False
+    
     data: Dict[str, pd.DataFrame] = {}
+    
     try:
-        for table in tables_to_use:
-            model_cls = orm_map.get(table)
-            if not model_cls:
-                log.warning("未找到 ORM 映射，跳过表: %s", table)
-                continue
-            try:
-                if limit is not None or offset is not None:
-                    # 使用缓存避免重复分页查询
-                    rows_dict = _cached_db_query(str(engine_to_use.url), table, limit, offset)
-                    df = pd.DataFrame(rows_dict)
-                else:
-                    stmt = select(model_cls)
-                    rows = local_session.execute(stmt).scalars().all()
-                    df = pd.DataFrame([row.__dict__ for row in rows])
-                if not df.empty and "_sa_instance_state" in df.columns:
-                    df = df.drop(columns=["_sa_instance_state"])
-                json_cols = JSON_FIELDS.get(table, [])
-                data[table] = _apply_json_fields(df, json_cols)
-            except Exception as exc:
-                log.exception("数据库读取失败: %s", table)
-                raise ValueError(f"数据库读取失败: {table}") from exc
+        # 一：基础元数据
+        # 1. 设备资产表
+        stmt = select(models.Asset)
+        if asset_id:
+            stmt = stmt.where(models.Asset.asset_id == asset_id)
+        assets = local_session.execute(stmt).scalars().all()
+        data["assets"] = pd.DataFrame([{
+            "asset_id": a.asset_id,
+            "name": a.name,
+            "model_id": a.model_id,
+            "location": a.location,
+            "commission_date": a.commission_date,
+            "status": a.status,
+        } for a in assets])
+        
+        # 2. 测点定义表
+        stmt = select(models.MetricDefinition)
+        if asset_id:
+            stmt = stmt.where(models.MetricDefinition.asset_id == asset_id)
+        metrics = local_session.execute(stmt).scalars().all()
+        data["metric_definitions"] = pd.DataFrame([{
+            "metric_id": m.metric_id,
+            "asset_id": m.asset_id,
+            "metric_name": m.metric_name,
+            "metric_type": m.metric_type.value if m.metric_type else None,
+            "unit": m.unit,
+            "warn_threshold": m.warn_threshold,
+            "crit_threshold": m.crit_threshold,
+            "is_condition_dependent": m.is_condition_dependent,
+            "sampling_frequency": m.sampling_frequency,
+        } for m in metrics])
+        
+        # 二：动态感知
+        # 3. 过程数据
+        stmt = select(models.TelemetryProcess)
+        if asset_id:
+            # 通过metric_id关联到asset_id
+            # 重要：如果 asset_id 不存在，metric_definitions 为空，应该返回空结果集
+            # 而不是返回所有数据，避免数据泄漏
+            metric_ids = data["metric_definitions"]["metric_id"].tolist() if not data["metric_definitions"].empty else []
+            if metric_ids:
+                # 只有当找到对应的 metric_ids 时才添加过滤条件
+                stmt = stmt.where(models.TelemetryProcess.metric_id.in_(metric_ids))
+            else:
+                # 如果 asset_id 存在但没有任何 metric_definitions，返回空结果集
+                # 使用一个不可能匹配的条件来确保返回空结果
+                stmt = stmt.where(models.TelemetryProcess.metric_id == "__NONEXISTENT__")
+        if start_time:
+            stmt = stmt.where(models.TelemetryProcess.timestamp >= start_time)
+        if end_time:
+            stmt = stmt.where(models.TelemetryProcess.timestamp <= end_time)
+        stmt = stmt.order_by(models.TelemetryProcess.timestamp)
+        process_data = local_session.execute(stmt).scalars().all()
+        data["telemetry_process"] = pd.DataFrame([{
+            "id": p.id,
+            "timestamp": p.timestamp,
+            "metric_id": p.metric_id,
+            "value": p.value,
+            "quality": p.quality,
+            "machine_state": p.machine_state,
+        } for p in process_data])
+        
+        # 4. 波形数据（只加载元数据，不加载二进制数据）
+        stmt = select(models.TelemetryWaveform)
+        if asset_id:
+            stmt = stmt.where(models.TelemetryWaveform.asset_id == asset_id)
+        if start_time:
+            stmt = stmt.where(models.TelemetryWaveform.timestamp >= start_time)
+        if end_time:
+            stmt = stmt.where(models.TelemetryWaveform.timestamp <= end_time)
+        waveforms = local_session.execute(stmt).scalars().all()
+        data["telemetry_waveform"] = pd.DataFrame([{
+            "snapshot_id": w.snapshot_id,
+            "asset_id": w.asset_id,
+            "timestamp": w.timestamp,
+            "sampling_rate": w.sampling_rate,
+            "duration_ms": w.duration_ms,
+            "axis": w.axis,
+            "ref_rpm": w.ref_rpm,
+            "metric_id": w.metric_id,
+            # 注意：data_blob不加载，需要时单独查询
+        } for w in waveforms])
+        
+        # 三：知识与运维
+        # 5. 运维记录
+        stmt = select(models.MaintenanceRecord)
+        if asset_id:
+            stmt = stmt.where(models.MaintenanceRecord.asset_id == asset_id)
+        if start_time:
+            stmt = stmt.where(models.MaintenanceRecord.start_time >= start_time)
+        if end_time:
+            stmt = stmt.where(models.MaintenanceRecord.end_time <= end_time)
+        maintenance = local_session.execute(stmt).scalars().all()
+        data["maintenance_records"] = pd.DataFrame([{
+            "record_id": m.record_id,
+            "asset_id": m.asset_id,
+            "start_time": m.start_time,
+            "end_time": m.end_time,
+            "failure_code": m.failure_code,
+            "issue_description": m.issue_description,
+            "solution_description": m.solution_description,
+            "cost": m.cost,
+        } for m in maintenance])
+        
+        # 6. 知识库
+        stmt = select(models.KnowledgeBase)
+        if asset_id:
+            # 通过model_id关联
+            model_ids = data["assets"]["model_id"].unique().tolist() if not data["assets"].empty else []
+            if model_ids:
+                stmt = stmt.where(models.KnowledgeBase.applicable_model.in_(model_ids))
+        knowledge = local_session.execute(stmt).scalars().all()
+        data["knowledge_base"] = pd.DataFrame([{
+            "doc_id": k.doc_id,
+            "applicable_model": k.applicable_model,
+            "category": k.category.value if k.category else None,
+            "title": k.title,
+            "content_chunk": k.content_chunk,
+        } for k in knowledge])
+        
+        # 四：分析结果
+        # 7. 健康分析结果
+        stmt = select(models.AIHealthAnalysis)
+        if asset_id:
+            stmt = stmt.where(models.AIHealthAnalysis.asset_id == asset_id)
+        if start_time:
+            stmt = stmt.where(models.AIHealthAnalysis.calc_time >= start_time)
+        if end_time:
+            stmt = stmt.where(models.AIHealthAnalysis.calc_time <= end_time)
+        stmt = stmt.order_by(models.AIHealthAnalysis.calc_time.desc())
+        health_analyses = local_session.execute(stmt).scalars().all()
+        data["ai_health_analysis"] = pd.DataFrame([{
+            "analysis_id": h.analysis_id,
+            "asset_id": h.asset_id,
+            "calc_time": h.calc_time,
+            "health_score": h.health_score,
+            "rul_days": h.rul_days,
+            "trend_slope": h.trend_slope,
+            "diagnosis_result": h.diagnosis_result,
+            "model_version": h.model_version,
+            "prediction_confidence": h.prediction_confidence,
+        } for h in health_analyses])
+        
+        # 8. AI报告
+        if not data["ai_health_analysis"].empty:
+            analysis_ids = data["ai_health_analysis"]["analysis_id"].tolist()
+            stmt = select(models.AIReport).where(models.AIReport.analysis_id.in_(analysis_ids))
+            reports = local_session.execute(stmt).scalars().all()
+            data["ai_reports"] = pd.DataFrame([{
+                "report_id": r.report_id,
+                "analysis_id": r.analysis_id,
+                "generated_content": r.generated_content,
+                "user_feedback": r.user_feedback,
+                "created_at": r.created_at,
+            } for r in reports])
+        else:
+            data["ai_reports"] = pd.DataFrame()
+        
+        log.info(f"数据加载完成: {len(data)} 个表")
+        for table_name, df in data.items():
+            log.debug(f"  {table_name}: {len(df)} 条记录")
+        
+    except Exception as e:
+        log.exception(f"数据加载失败: {e}")
+        raise
     finally:
         if created_session:
             local_session.close()
+    
     return data
 
 
-def get_data(
-    source_type: str = "csv",
-    tables: Optional[Iterable[str]] = None,
-    base: Path = CSV_PATH,
-    session: Optional[Session] = None,
-    db_engine: Optional[Engine] = None,
-    limit: Optional[int] = None,
-    offset: Optional[int] = None,
-    verbose: bool = False,
-) -> Dict[str, Any]:
-    """
-    统一数据获取入口
-        支持 CSV/DB 两种来源（source_type: csv/db）
-        自动处理 JSON 字段
-        返回标准化结构：{"data": {...}, "metadata": {...}}
-    """
-    if source_type == "csv" and not tables:
-        metadata_tables = _resolve_csv_tables(tables=None, base=base)
-    else:
-        metadata_tables = list(tables) if tables else DEFAULT_TABLES
-    metadata: Dict[str, Any] = {
-        "source": source_type,
-        "tables": metadata_tables,
-        "errors": [],
-        "pagination": {"limit": limit, "offset": offset},
-    }
-    try:
-        if source_type == "csv":
-            data = _get_data_from_csv(tables=tables, base=base, verbose=verbose)
-        elif source_type == "db":
-            data = _get_data_from_db(
-                tables=tables,
-                session=session,
-                db_engine=db_engine,
-                limit=limit,
-                offset=offset,
-            )
-        else:
-            raise ValueError(f"未知数据源类型: {source_type}")
-    except Exception as exc:
-        metadata["errors"].append(str(exc))
-        log.exception("获取数据失败: %s", exc)
-        raise
-    return {"data": data, "metadata": metadata}
-
-
-def load_data_from_csv(
-    base: Path = CSV_PATH,
-    tables: Optional[Iterable[str]] = None,
-    verbose: bool = False,
-) -> Dict[str, pd.DataFrame]:
-    result = get_data(source_type="csv", tables=tables, base=base, verbose=verbose)
-    return result["data"]
-
-
-def load_data_from_db(
-    tables: Optional[Iterable[str]] = None,
-    session: Optional[Session] = None,
-    db_engine: Optional[Engine] = None,
-    limit: Optional[int] = None,
-    offset: Optional[int] = None,
-) -> Dict[str, pd.DataFrame]:
-    result = get_data(
-        source_type="db",
-        tables=tables,
-        session=session,
-        db_engine=db_engine,
-        limit=limit,
-        offset=offset,
-    )
-    data = result["data"]
-    return _ensure_inspection_submits(data)
-
-
-def _ensure_inspection_submits(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-    """
-    Ensure data bundle contains inspection_submits dataframe similar to CSV dataset.
-    - If DB only has inspection_logs + inspection_metric_values, compose them.
-    - If inspection_submits exists but没有 metrics 列，也会用 logs+metric_values 重建。
-    """
-    logs_df = None
-    if "inspection_submits" in data:
-        # 兼容：如果已有 CSV 风格的数据且包含 metrics 列，直接返回
-        existing = data["inspection_submits"]
-        if "metrics" in existing.columns:
-            return data
-        logs_df = existing
-    if logs_df is None:
-        logs_df = data.get("inspection_logs") or data.get("inspection_submits")
-    if logs_df is None or logs_df.empty:
-        return data
-
-    logs_df = logs_df.copy()
-    metrics_df = data.get("inspection_metric_values")
-    if metrics_df is not None and not metrics_df.empty:
-        merged = logs_df.merge(
-            metrics_df,
-            left_on="id",
-            right_on="log_id",
-            how="left",
-            suffixes=("", "_metric"),
-        )
-        merged["metrics"] = merged.get("metrics_data", pd.Series([{}] * len(merged))).apply(
-            lambda val: val if isinstance(val, dict) else (val or {})
-        )
-        merged = merged.drop(columns=[col for col in ("log_id", "metrics_data") if col in merged.columns])
-    else:
-        merged = logs_df
-        merged["metrics"] = [{}] * len(merged)
-
-    # Align column name with CSV expectation
-    if "record_time" in merged.columns and "recorded_at" not in merged.columns:
-        merged = merged.rename(columns={"record_time": "recorded_at"})
-
-    data["inspection_submits"] = merged
-    return data
-
-
-def _normalize_series(values: pd.Series) -> pd.Series:
-    """最小-最大归一化，避免除零"""
-    if values.empty:
-        return values
-    v_min, v_max = values.min(), values.max()
-    if v_max == v_min:
-        return pd.Series([0.0] * len(values), index=values.index)
-    return (values - v_min) / (v_max - v_min)
-
-
-def prepare_metric_series(
-    data: Optional[Dict[str, pd.DataFrame]] = None,
-    metric_key: str = "",
-    device_id: Optional[int] = None,
-    window_days: int = 30,
-    safety_confidence: float = 0.8,
-    source_type: str = "csv",
-    base: Path = CSV_PATH,
-    session: Optional[Session] = None,
-) -> pd.DataFrame:
-    if data is None:
-        data = get_data(source_type=source_type, base=base, session=session)["data"]
-    df_irf = data.get("inspection_submits", pd.DataFrame()).copy()
-    if df_irf.empty:
-        return pd.DataFrame(columns=["record_time", "value", "quality", "value_norm"])
-    if device_id is not None and "device_id" in df_irf.columns:
-        df_irf = df_irf[df_irf["device_id"] == device_id]
-    df_irf["record_time"] = pd.to_datetime(df_irf.get("recorded_at"), errors="coerce")
-    df_irf["value"] = df_irf["metrics"].apply(
-        lambda line: float(line.get(metric_key, np.nan)) if isinstance(line, dict) else np.nan
-    )
-    df_irf["quality"] = df_irf.get("data_quality_score", 0.8).fillna(0.8)
-    df_irf = df_irf.dropna(subset=["record_time", "value"])
-    if df_irf.empty:
-        return pd.DataFrame(columns=["record_time", "value", "quality", "value_norm"])
-
-    # 窗口过滤
-    cutoff = df_irf["record_time"].max() - pd.Timedelta(days=window_days)
-    df_irf = df_irf[(df_irf["record_time"] >= cutoff) & (df_irf["quality"] >= safety_confidence)]
-    if df_irf.empty:
-        return pd.DataFrame(columns=["record_time", "value", "quality", "value_norm"])
-
-    # 按日对齐时间序列并填充缺失
-    df_irf = df_irf.sort_values("record_time").set_index("record_time")
-    full_range = pd.date_range(start=df_irf.index.min(), end=df_irf.index.max(), freq="D")
-    df_irf = df_irf.reindex(full_range)
-    df_irf["value"] = df_irf["value"].interpolate().fillna(method="bfill").fillna(method="ffill")
-    df_irf["quality"] = df_irf["quality"].fillna(df_irf["quality"].mean())
-
-    # 归一化
-    df_irf["value_norm"] = _normalize_series(df_irf["value"])
-    df_irf = df_irf.reset_index().rename(columns={"index": "record_time"})
-    return df_irf[["record_time", "value", "quality", "value_norm"]]
-
-
-def prepare_rul_series(
-    data: Optional[Dict[str, pd.DataFrame]] = None,
-    metric_key: str = "",
-    device_id: Optional[int] = None,
-    window_days: int = 30,
-    source_type: str = "csv",
-    base: Path = CSV_PATH,
-    session: Optional[Session] = None,
-) -> pd.DataFrame:
-    """
-    获取 RUL 序列，识别特征列并返回标准化格式。
-    """
-    if data is None:
-        data = get_data(source_type=source_type, base=base, session=session)["data"]
-    df = data.get("metric_ai_analysis", pd.DataFrame()).copy()
-    if df.empty:
-        return pd.DataFrame(columns=["record_time", "rul_days", "rul_estimated_end"])
-    if device_id is not None and "device_id" in df.columns:
-        df = df[df["device_id"] == device_id]
-    if "metric_key" in df.columns:
-        df = df[df["metric_key"] == metric_key]
-    if df.empty or "rul_days" not in df.columns:
-        return pd.DataFrame(columns=["record_time", "rul_days", "rul_estimated_end"])
-    df["record_time"] = pd.to_datetime(df.get("calc_time"), errors="coerce")
-    df = df.dropna(subset=["record_time", "rul_days"])
-    if df.empty:
-        return pd.DataFrame(columns=["record_time", "rul_days", "rul_estimated_end"])
-    cutoff = df["record_time"].max() - pd.Timedelta(days=window_days)
-    df = df[df["record_time"] >= cutoff]
-    df["rul_estimated_end"] = df["record_time"] + pd.to_timedelta(df["rul_days"], unit="D")
-    return df.sort_values("record_time")[["record_time", "rul_days", "rul_estimated_end"]]
-
-
-def get_metric_def(
+def prepare_process_series(
     data: Dict[str, pd.DataFrame],
-    metric_key: str,
-    device_id: Optional[int] = None,
-) -> Optional[Dict[str, Any]]:
-    """提取阈值/趋势方向"""
-    df = data.get("device_metric_definitions", pd.DataFrame())
-    if device_id is not None and "devices" in data:
-        device_row = data["devices"][data["devices"]["id"] == device_id]
-        if not device_row.empty:
-            df = df[df["model_id"] == device_row.iloc[0]["model_id"]]
-    df = df[df["metric_key"] == metric_key]
-    if df.empty:
-        return None
-    row = df.iloc[0]
-    return {
-        "crit_threshold": row.get("crit_threshold"),
-        "warn_threshold": row.get("warn_threshold"),
-        "trend_direction": row.get("trend_direction"),
-        "weight_in_health": row.get("weight_in_health", 1.0),
-        "criticality": row.get("criticality", "medium"),
-    }
-
-
-def _flatten_metrics(df_irf: pd.DataFrame, metrics_filter: Optional[Iterable[str]] = None) -> pd.DataFrame:
-    """
-    展开 inspection_submits.metrics 字段。
-        将嵌套的 metrics 字典拆成 device_id/metric_key/value 结构
-        metrics_filter 可仅保留关心的指标，减少无关计算量
-    """
-    records: List[Dict[str, Any]] = []
-    metric_set = set(metrics_filter) if metrics_filter else None
-    for _, row in df_irf.iterrows():
-        metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
-        device_id = row.get("device_id")
-        record_time = row.get("recorded_at")
-        for k, v in metrics.items():
-            if metric_set and k not in metric_set:
-                continue
-            try:
-                value = float(v)
-            except (TypeError, ValueError):
-                continue
-            records.append({"device_id": device_id, "metric_key": k, "value": value, "record_time": record_time})
-    return pd.DataFrame(records)
-
-
-def _clip_outliers(series: pd.Series) -> pd.Series:
-    """
-    对指标值做分位截断，过滤掉极端值对健康分的影响。
-    """
-    if series.empty:
-        return series
-    q_low, q_high = series.quantile(0.01), series.quantile(0.99)
-    return series.clip(lower=q_low, upper=q_high)
-
-
-def aggregate_device_health(
-    source_type: str = "csv",
-    base: Path = CSV_PATH,
-    session: Optional[Session] = None,
-    metrics_of_interest: Optional[Iterable[str]] = None,
+    metric_id: str,
+    asset_id: Optional[str] = None,
+    window_days: int = 30,
+    machine_state: Optional[int] = None,
+    quality_threshold: int = 1,
 ) -> pd.DataFrame:
     """
-    设备健康度聚合
-        负责：取数 + 指标展开 + 聚合统计 + 分数计算
-        返回：以 device_id 为单位的健康度表，并附带各指标的均值/极值等统计列
+    准备过程数据时间序列
+    
+    Args:
+        data: 数据字典
+        metric_id: 测点ID
+        asset_id: 设备ID（可选）
+        window_days: 时间窗口（天）
+        machine_state: 工况状态过滤（None=不过滤，0=停机，1=待机，2=加工）
+        quality_threshold: 数据质量阈值（0或1）
+    
+    Returns:
+        时间序列DataFrame，包含timestamp, value, quality, machine_state
     """
-    payload = get_data(source_type=source_type, base=base, session=session)
-    data = payload["data"]
-    df_irf = data.get("inspection_submits", pd.DataFrame())
-    defs = data.get("device_metric_definitions", pd.DataFrame())
-    if df_irf.empty or defs.empty:
-        return pd.DataFrame(columns=["device_id", "health_score"])
+    df = data.get("telemetry_process", pd.DataFrame())
+    if df.empty:
+        return pd.DataFrame(columns=["timestamp", "value", "quality", "machine_state"])
+    
+    # 过滤测点
+    df = df[df["metric_id"] == metric_id].copy()
+    
+    # 过滤设备（通过metric_id关联）
+    if asset_id:
+        metrics_df = data.get("metric_definitions", pd.DataFrame())
+        if not metrics_df.empty:
+            asset_metrics = metrics_df[metrics_df["asset_id"] == asset_id]["metric_id"].tolist()
+            df = df[df["metric_id"].isin(asset_metrics)]
+    
+    # 过滤数据质量
+    df = df[df["quality"] >= quality_threshold]
+    
+    # 过滤工况状态
+    if machine_state is not None:
+        df = df[df["machine_state"] == machine_state]
+    
+    # 时间窗口过滤
+    if not df.empty:
+        max_time = df["timestamp"].max()
+        cutoff = max_time - pd.Timedelta(days=window_days)
+        df = df[df["timestamp"] >= cutoff]
+    
+    # 排序
+    if not df.empty:
+        df = df.sort_values("timestamp")
+    
+    return df[["timestamp", "value", "quality", "machine_state"]]
 
-    metric_keys = list(metrics_of_interest) if metrics_of_interest else defs.get("metric_key", []).tolist()
-    metrics_df = _flatten_metrics(df_irf, metrics_filter=metric_keys)
-    if metrics_df.empty:
-        return pd.DataFrame(columns=["device_id", "health_score"])
 
-    metrics_df["value"] = _clip_outliers(metrics_df["value"])
-
-    agg_df = metrics_df.groupby(["device_id", "metric_key"])["value"].agg(["mean", "max", "std"]).reset_index()
-
-    weight_map = {row["metric_key"]: row.get("weight_in_health", 1.0) for _, row in defs.iterrows()}
-    warn_map = {row["metric_key"]: row.get("warn_threshold") for _, row in defs.iterrows()}
-    crit_map = {row["metric_key"]: row.get("crit_threshold") for _, row in defs.iterrows()}
-
-    def _metric_score(row: pd.Series) -> float:
-        """根据阈值与均值计算单指标健康度 0-100"""
-        metric_key = row["metric_key"]
-        value_mean = row["mean"]
-        warn = warn_map.get(metric_key)
-        crit = crit_map.get(metric_key)
-        if warn is None or crit is None or crit == warn:
-            return 100.0
-        ratio = (value_mean - warn) / (crit - warn)
-        ratio = float(np.clip(ratio, 0.0, 1.0))
-        return float(round(100.0 * (1.0 - ratio), 1))
-
-    agg_df["metric_score"] = agg_df.apply(_metric_score, axis=1)
-    agg_df["weight"] = agg_df["metric_key"].apply(lambda k: weight_map.get(k, 1.0))
-
-    device_scores = (
-        agg_df.groupby("device_id")
-        .apply(
-            lambda g: pd.Series(
-                {
-                    "health_score": round(np.average(g["metric_score"], weights=g["weight"]), 1)
-                    if g["weight"].sum() > 0
-                    else 0.0
-                }
-            )
+def load_waveform_data(
+    session: Session,
+    snapshot_id: str,
+) -> Optional[np.ndarray]:
+    """
+    加载波形数据的二进制数组
+    
+    Args:
+        session: 数据库会话
+        snapshot_id: 快照ID
+    
+    Returns:
+        numpy数组，如果不存在则返回None
+    """
+    from backend import models
+    
+    waveform = session.execute(
+        select(models.TelemetryWaveform).where(
+            models.TelemetryWaveform.snapshot_id == snapshot_id
         )
-        .reset_index()
-    )
+    ).scalar_one_or_none()
+    
+    if waveform and waveform.data_blob:
+        # 将二进制数据转换为numpy数组
+        # 注意：需要知道原始数据类型和形状，这里假设是float32
+        try:
+            arr = np.frombuffer(waveform.data_blob, dtype=np.float32)
+            return arr
+        except Exception as e:
+            log.warning(f"波形数据解析失败: {e}")
+            return None
+    
+    return None
 
-    stats_wide = agg_df.pivot_table(
-        index="device_id",
-        columns="metric_key",
-        values=["mean", "max", "std"],
-    )
-    stats_wide.columns = [f"{stat}_{metric}" for stat, metric in stats_wide.columns]
-    stats_wide = stats_wide.reset_index()
 
-    result = device_scores.merge(stats_wide, on="device_id", how="left")
-    return result
-
-
-@contextmanager
-def transaction_scope(existing_session: Optional[Session] = None) -> Any:
+def get_maintenance_labels(
+    data: Dict[str, pd.DataFrame],
+    asset_id: str,
+    start_time: pd.Timestamp,
+    end_time: pd.Timestamp,
+) -> List[Dict[str, Any]]:
     """
-    事务上下文管理器，支持 with 使用，自动提交/回滚。
+    获取维护标签（用于AI训练）
+    
+    Args:
+        data: 数据字典
+        asset_id: 设备ID
+        start_time: 开始时间
+        end_time: 结束时间
+    
+    Returns:
+        标签列表，每个标签包含时间段和故障代码
     """
-    session = existing_session or SessionLocal()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        if existing_session is None:
-            session.close()
+    df = data.get("maintenance_records", pd.DataFrame())
+    if df.empty:
+        return []
+    
+    df = df[df["asset_id"] == asset_id].copy()
+    df = df[
+        (df["start_time"] >= start_time) & 
+        (df["start_time"] <= end_time)
+    ]
+    
+    labels = []
+    for _, row in df.iterrows():
+        labels.append({
+            "start_time": row["start_time"],
+            "end_time": row["end_time"] if pd.notna(row["end_time"]) else end_time,
+            "failure_code": row["failure_code"],
+            "issue_description": row["issue_description"],
+        })
+    
+    return labels
+
+
+def get_knowledge_context(
+    data: Dict[str, pd.DataFrame],
+    model_id: Optional[str] = None,
+    category: Optional[str] = None,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """
+    获取知识库上下文（用于LLM RAG）
+    
+    Args:
+        data: 数据字典
+        model_id: 型号ID（可选）
+        category: 类别（可选）
+        limit: 返回数量限制
+    
+    Returns:
+        知识片段列表
+    """
+    df = data.get("knowledge_base", pd.DataFrame())
+    if df.empty:
+        return []
+    
+    if model_id:
+        df = df[df["applicable_model"] == model_id]
+    if category:
+        df = df[df["category"] == category]
+    
+    df = df.head(limit)
+    
+    return [
+        {
+            "doc_id": row["doc_id"],
+            "title": row["title"],
+            "content": row["content_chunk"],
+            "category": row["category"],
+        }
+        for _, row in df.iterrows()
+    ]
 

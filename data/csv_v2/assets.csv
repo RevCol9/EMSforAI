@@ -1,0 +1,6 @@
+asset_id,name,model_id,location,commission_date,status
+CNC-MAZAK-01,1号卧式加工中心,MAZAK-H800,一车间-C区,2023-01-01,active
+CNC-MAZAK-02,2号卧式加工中心,MAZAK-H800,一车间-C区,2023-03-15,active
+COMP-ATLAS-01,1号空压机,ATLAS-GA75,动力车间,2023-06-01,active
+COMP-ATLAS-02,2号空压机,ATLAS-GA75,动力车间,2023-08-10,active
+MILL-HAAS-01,1号立式铣床,HAAS-VF2,二车间-A区,2023-04-20,active

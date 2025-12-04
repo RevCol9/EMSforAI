@@ -1,5 +1,0 @@
-id,model_id,name,serial_number,location,status
-1,1,VM-500-A01,VM500-20231108-A01,Line1-Station3,active
-2,2,COMP-75-01,AC75-20231001-01,Utility-Room-2,active
-3,1,VM-500-A02,VM500-20240115-A02,Line2-Station1,active
-4,2,COMP-75-02,AC75-20240220-02,Utility-Room-1,active
